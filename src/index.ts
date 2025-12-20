@@ -12,6 +12,8 @@ export interface OgcApiOptions {
 
   /**
    * Enable CORS headers
+   * Note: When enabled, sets Access-Control-Allow-Origin to '*'
+   * For production use with credentials, configure CORS middleware separately
    * @default true
    */
   cors?: boolean;
@@ -71,6 +73,11 @@ export function ogcApiMiddleware(options: OgcApiOptions = {}) {
     conformsTo = DEFAULT_CONFORMS_TO,
   } = options;
 
+  // Normalize base path to ensure it starts with '/' and doesn't end with '/'
+  const normalizedBasePath = basePath.startsWith('/')
+    ? basePath.replace(/\/$/, '')
+    : `/${basePath}`.replace(/\/$/, '');
+
   return (req: Request, res: Response, next: NextFunction): void => {
     // Add CORS headers if enabled
     if (cors) {
@@ -80,25 +87,25 @@ export function ogcApiMiddleware(options: OgcApiOptions = {}) {
     }
 
     // Handle landing page
-    if (req.path === basePath || req.path === `${basePath}/`) {
+    if (req.path === normalizedBasePath || req.path === `${normalizedBasePath}/`) {
       res.json({
         title,
         description,
         links: [
           {
-            href: `${basePath}/`,
+            href: `${normalizedBasePath}/`,
             rel: 'self',
             type: 'application/json',
             title: 'This document',
           },
           {
-            href: `${basePath}/conformance`,
+            href: `${normalizedBasePath}/conformance`,
             rel: 'conformance',
             type: 'application/json',
             title: 'Conformance declaration',
           },
           {
-            href: `${basePath}/api`,
+            href: `${normalizedBasePath}/api`,
             rel: 'service-desc',
             type: 'application/vnd.oai.openapi+json;version=3.0',
             title: 'API definition',
@@ -109,7 +116,7 @@ export function ogcApiMiddleware(options: OgcApiOptions = {}) {
     }
 
     // Handle conformance endpoint
-    if (req.path === `${basePath}/conformance`) {
+    if (req.path === `${normalizedBasePath}/conformance`) {
       res.json({
         conformsTo,
       });
@@ -117,7 +124,7 @@ export function ogcApiMiddleware(options: OgcApiOptions = {}) {
     }
 
     // Handle API definition endpoint
-    if (req.path === `${basePath}/api`) {
+    if (req.path === `${normalizedBasePath}/api`) {
       res.json({
         openapi: '3.0.3',
         info: {
@@ -125,7 +132,41 @@ export function ogcApiMiddleware(options: OgcApiOptions = {}) {
           description,
           version: '1.0.0',
         },
-        paths: {},
+        paths: {
+          [`${normalizedBasePath}/`]: {
+            get: {
+              summary: 'Landing page',
+              description: 'The landing page provides links to start exploring the API',
+              responses: {
+                '200': {
+                  description: 'Links to the API capabilities',
+                },
+              },
+            },
+          },
+          [`${normalizedBasePath}/conformance`]: {
+            get: {
+              summary: 'Conformance declaration',
+              description: 'Information about the standards this API conforms to',
+              responses: {
+                '200': {
+                  description: 'Conformance classes',
+                },
+              },
+            },
+          },
+          [`${normalizedBasePath}/api`]: {
+            get: {
+              summary: 'API definition',
+              description: 'This document',
+              responses: {
+                '200': {
+                  description: 'The OpenAPI definition',
+                },
+              },
+            },
+          },
+        },
       });
       return;
     }
