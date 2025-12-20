@@ -1,0 +1,12 @@
+src
+test
+examples
+tsconfig.json
+.eslintrc.json
+.prettierrc.json
+.gitignore
+*.log
+.vscode
+.idea
+*.tgz
+node_modules
