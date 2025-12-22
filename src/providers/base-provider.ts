@@ -1,3 +1,4 @@
+// biome-ignore assist/source/organizeImports: <explanation>
 import type {
   Collection,
   Feature,
@@ -7,6 +8,7 @@ import type {
   UpdateFeatureParams,
 } from '@/types';
 import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
+import type { NextFunction, Router, Request, Response } from 'express';
 
 export interface ProviderDef {
   name: string;
@@ -125,6 +127,31 @@ export abstract class BaseProvider {
   // Abstract methods for collection management
   abstract addCollection(collection: Collection): void;
   abstract addFeature(collectionId: string, feature: Feature): void;
+
+  preProviderHook(_req: Request, _res: Response): void {
+    console.log('Pre-provider hook executed');
+    return;
+  }
+
+  postProviderHook(_req: Request, _res: Response): void {
+    console.log('Post-provider hook executed');
+    return;
+  }
+
+  setupProviderHooks(router: Router): void {
+    router.use((req: Request, res: Response, next: NextFunction) => {
+      this.preProviderHook(req, res);
+      next();
+    });
+
+    router.use((req: Request, res: Response, next: NextFunction) => {
+      res.on('finish', () => {
+        this.postProviderHook(req, res);
+      });
+      next();
+    });
+  }
+
 }
 
 export default BaseProvider;

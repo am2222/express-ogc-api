@@ -3,7 +3,6 @@
 import { describe, it, beforeAll, afterAll, expect } from 'vitest';
 import express from 'express';
 import { OGCAPI, InMemoryProvider } from '../src/index.js';
-import { METHODS } from 'http';
 
 describe('OGC API LandingPage', () => {
   let app: express.Express;
@@ -98,7 +97,7 @@ describe('OGC API LandingPage', () => {
     });
 
     const ogcAPIRoutes = new OGCAPI(
-      memoryProvider, {
+      memoryProvider,app, {
       basePath: '/ogc',
       title: 'Test API',
       description: 'Test Description',

@@ -36,6 +36,12 @@ export class BaseHandler {
     next();
   }
 
+  preProviderHook(req: Request, res: Response, next: NextFunction): void {
+    // Hook to run before provider methods
+    this.provider.preProviderHook(req, res);
+    next();
+  }
+
   isProviderConformed(): boolean {
     if (!this.provider) {
       return false;
@@ -83,7 +89,6 @@ export class BaseHandler {
     throw new Error('Must implement setupRoutes in subclass');
   }
 
-  
 }
 
 export default BaseHandler;

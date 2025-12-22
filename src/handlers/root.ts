@@ -49,6 +49,12 @@ export class RootHandler extends BaseHandler {
           title: 'Collections',
         },
         {
+          href: this.buildUrl(req, '/api'),
+          rel: 'service-desc',
+          type: 'application/vnd.oai.openapi+json;version=3.0',
+          title: 'API definition'
+        },
+        {
           href: 'https://docs.ogc.org/is/17-069r4/17-069r4.html',
           rel: 'service-doc',
           type: 'text/html',
@@ -94,6 +100,300 @@ export class RootHandler extends BaseHandler {
     res.send();
   }
   
+  private generateOpenAPISpec(): any {
+    return {
+      openapi: '3.0.0',
+      info: {
+        title: this.title,
+        version: '1.0.0',
+        description: this.description,
+        contact: {
+          name: 'API Support'
+        }
+      },
+      servers: [
+        {
+          url: this.basePath || '/',
+          description: 'OGC API - Features Server'
+        }
+      ],
+      paths: {
+        '/': {
+          get: {
+            tags: ['Capabilities'],
+            summary: 'Landing page',
+            description: 'The landing page provides links to the API definition, conformance statements, and collections.',
+            responses: {
+              '200': {
+                description: 'Links to the API capabilities',
+                content: {
+                  'application/json': {
+                    schema: { $ref: '#/components/schemas/LandingPage' }
+                  }
+                }
+              }
+            }
+          }
+        },
+        '/conformance': {
+          get: {
+            tags: ['Capabilities'],
+            summary: 'Conformance declaration',
+            description: 'Lists the conformance classes implemented by this API',
+            responses: {
+              '200': {
+                description: 'Conformance declaration',
+                content: {
+                  'application/json': {
+                    schema: { $ref: '#/components/schemas/Conformance' }
+                  }
+                }
+              }
+            }
+          }
+        },
+        '/collections': {
+          get: {
+            tags: ['Capabilities'],
+            summary: 'List collections',
+            description: 'Lists all available feature collections',
+            responses: {
+              '200': {
+                description: 'List of collections',
+                content: {
+                  'application/json': {
+                    schema: { $ref: '#/components/schemas/Collections' }
+                  }
+                }
+              }
+            }
+          }
+        },
+        '/collections/{collectionId}': {
+          get: {
+            tags: ['Capabilities'],
+            summary: 'Collection metadata',
+            description: 'Metadata about a specific collection',
+            parameters: [
+              {
+                name: 'collectionId',
+                in: 'path',
+                required: true,
+                schema: { type: 'string' },
+                description: 'Collection identifier'
+              }
+            ],
+            responses: {
+              '200': {
+                description: 'Collection metadata',
+                content: {
+                  'application/json': {
+                    schema: { $ref: '#/components/schemas/Collection' }
+                  }
+                }
+              },
+              '404': {
+                description: 'Collection not found'
+              }
+            }
+          }
+        },
+        '/collections/{collectionId}/items': {
+          get: {
+            tags: ['Data'],
+            summary: 'Get features',
+            description: 'Fetch features from a collection',
+            parameters: [
+              {
+                name: 'collectionId',
+                in: 'path',
+                required: true,
+                schema: { type: 'string' },
+                description: 'Collection identifier'
+              },
+              {
+                name: 'limit',
+                in: 'query',
+                schema: { type: 'integer', minimum: 1, maximum: this.provider.maxLimit, default: this.provider.defaultLimit },
+                description: 'Maximum number of features to return'
+              },
+              {
+                name: 'offset',
+                in: 'query',
+                schema: { type: 'integer', minimum: 0, default: 0 },
+                description: 'Number of features to skip'
+              },
+              {
+                name: 'bbox',
+                in: 'query',
+                schema: { type: 'string' },
+                description: 'Bounding box (minX,minY,maxX,maxY)',
+                example: '-180,-90,180,90'
+              },
+              {
+                name: 'datetime',
+                in: 'query',
+                schema: { type: 'string' },
+                description: 'Temporal filter (RFC 3339)',
+                example: '2023-01-01T00:00:00Z/..'
+              }
+            ],
+            responses: {
+              '200': {
+                description: 'GeoJSON FeatureCollection',
+                content: {
+                  'application/geo+json': {
+                    schema: { $ref: '#/components/schemas/FeatureCollection' }
+                  }
+                }
+              }
+            }
+          }
+        },
+        '/collections/{collectionId}/items/{featureId}': {
+          get: {
+            tags: ['Data'],
+            summary: 'Get a feature',
+            description: 'Fetch a single feature by ID',
+            parameters: [
+              {
+                name: 'collectionId',
+                in: 'path',
+                required: true,
+                schema: { type: 'string' }
+              },
+              {
+                name: 'featureId',
+                in: 'path',
+                required: true,
+                schema: { type: 'string' }
+              }
+            ],
+            responses: {
+              '200': {
+                description: 'GeoJSON Feature',
+                content: {
+                  'application/geo+json': {
+                    schema: { $ref: '#/components/schemas/Feature' }
+                  }
+                }
+              },
+              '404': {
+                description: 'Feature not found'
+              }
+            }
+          }
+        }
+      },
+      components: {
+        schemas: {
+          LandingPage: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              description: { type: 'string' },
+              links: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/Link' }
+              }
+            }
+          },
+          Conformance: {
+            type: 'object',
+            properties: {
+              conformsTo: {
+                type: 'array',
+                items: { type: 'string' }
+              }
+            }
+          },
+          Collections: {
+            type: 'object',
+            properties: {
+              links: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/Link' }
+              },
+              collections: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/Collection' }
+              }
+            }
+          },
+          Collection: {
+            type: 'object',
+            required: ['id', 'links'],
+            properties: {
+              id: { type: 'string' },
+              title: { type: 'string' },
+              description: { type: 'string' },
+              links: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/Link' }
+              },
+              extent: {
+                type: 'object',
+                properties: {
+                  spatial: {
+                    type: 'object',
+                    properties: {
+                      bbox: {
+                        type: 'array',
+                        items: {
+                          type: 'array',
+                          minItems: 4,
+                          maxItems: 6,
+                          items: { type: 'number' }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          FeatureCollection: {
+            type: 'object',
+            required: ['type', 'features'],
+            properties: {
+              type: { type: 'string', enum: ['FeatureCollection'] },
+              features: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/Feature' }
+              },
+              links: {
+                type: 'array',
+                items: { $ref: '#/components/schemas/Link' }
+              },
+              numberMatched: { type: 'integer' },
+              numberReturned: { type: 'integer' },
+              timeStamp: { type: 'string', format: 'date-time' }
+            }
+          },
+          Feature: {
+            type: 'object',
+            required: ['type', 'geometry', 'properties'],
+            properties: {
+              type: { type: 'string', enum: ['Feature'] },
+              id: { oneOf: [{ type: 'string' }, { type: 'number' }] },
+              geometry: { type: 'object' },
+              properties: { type: 'object' }
+            }
+          },
+          Link: {
+            type: 'object',
+            required: ['href', 'rel'],
+            properties: {
+              href: { type: 'string', format: 'uri' },
+              rel: { type: 'string' },
+              type: { type: 'string' },
+              title: { type: 'string' }
+            }
+          }
+        }
+      }
+    };
+  }
   setupRoutes(router: Router) {
     // Landing page
     router.get('/', this.handleLandingPage.bind(this));
@@ -101,7 +401,14 @@ export class RootHandler extends BaseHandler {
     // Conformance
     router.get('/conformance', this.handleConformance.bind(this));
     // OPTIONS for root
-    router.options('/', this.handleOptionsRequests.bind(this));
+    router.options('*', this.handleOptionsRequests.bind(this));
+
+    const swaggerSpec = this.generateOpenAPISpec();
+
+    // Serve OpenAPI JSON
+    router.get('/api', (_req, res) => {
+      res.json(swaggerSpec);
+    });
   }
 }
 

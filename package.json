@@ -17,6 +17,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "example": "tsx examples/example-duckdb-provider.ts",
     "test": "vitest",
     "test:debug": "vitest --inspect-brk",
     "test:ui": "vitest --ui",
@@ -52,13 +53,17 @@
     "express": "^4.18.2",
     "prettier": "^3.1.1",
     "tsc-alias": "^1.8.16",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3",
     "vite": "^7.3.0",
     "vitest": "^4.0.16"
   },
   "dependencies": {
+    "@duckdb/node-api": "^1.4.3-r.1",
+    "duckdb-async": "^1.4.2",
     "express": "^4.18.0 || ^5.0.0",
     "express-jsdoc-swagger": "^1.8.0",
+    "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1"
   }
 }

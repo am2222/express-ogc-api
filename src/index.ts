@@ -1,3 +1,4 @@
+/** biome-ignore-all assist/source/organizeImports: <explanation> */
 import express, { Router } from 'express';
 import type { Application } from 'express';
 import RootHandler from '@/handlers/root';
@@ -14,7 +15,7 @@ export class OGCAPI {
   provider: BaseProvider;
   app: Application;
 
-  constructor(provider: BaseProvider, app:Application, options: OGCFeaturesConfig = {}) {
+  constructor(provider: BaseProvider, app: Application, options: OGCFeaturesConfig = {}) {
     this.router = Router();
     this.provider = provider;
     this.options = options;
@@ -34,6 +35,8 @@ export class OGCAPI {
       this.app.use(express.json({ type: ['application/json', 'application/geo+json'] }));
       console.log('Dynamically added JSON body parser to app');
     }
+
+    this.provider.setupProviderHooks(this.router);
     const root = new RootHandler(this.provider, this.options);
 
     if (!root.isProviderConformed()) {
@@ -73,5 +76,7 @@ export class OGCAPI {
 export default OGCAPI;
 export { InMemoryProvider } from '@/providers/in-memory-provider';
 export { BaseProvider } from '@/providers/base-provider';
-export type { OGCFeaturesConfig } from '@/types';
+export type { OGCFeaturesConfig,Feature } from '@/types';
 export { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
+export { DuckDBProvider } from '@/providers/duck-db-provider';
+export type { DuckDBProviderDef } from '@/providers/duck-db-provider';
