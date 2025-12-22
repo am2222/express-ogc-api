@@ -330,16 +330,7 @@ export class ItemsCURDHandler extends BaseHandler {
     }
   }
 
-  private handleOptionsItems(_req: Request, res: Response): void {
-    // OGC API Part 4 compliance: Return 200 OK with Allow header listing supported methods
-    res.status(200);
-    const allowMethods = ['GET', 'HEAD', 'OPTIONS'];
-    if (this.provider.enableTransactions) {
-      allowMethods.push('POST', 'PUT', 'PATCH', 'DELETE');
-    }
-    res.set('Allow', allowMethods.join(', '));
-    res.send();
-  }
+
   setupRoutes(router: Router) {
     // Features - GET
     router.get(
@@ -379,10 +370,6 @@ export class ItemsCURDHandler extends BaseHandler {
         this.handleDeleteFeature.bind(this)
       );
 
-      router.options(
-        '/collections/:collectionId/items',
-        this.handleOptionsItems.bind(this)
-      );
     }
   }
 }

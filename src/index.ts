@@ -1,4 +1,5 @@
-import { Router } from 'express';
+import express, { Router } from 'express';
+import type { Application } from 'express';
 import RootHandler from '@/handlers/root';
 import CRUDHandler from '@/handlers/items-curd';
 import SchemaHandler from '@/handlers/schema';
@@ -11,11 +12,13 @@ export class OGCAPI {
   router: Router;
   options: OGCFeaturesConfig = {};
   provider: BaseProvider;
+  app: Application;
 
-  constructor(provider: BaseProvider, options = {}) {
+  constructor(provider: BaseProvider, app:Application, options: OGCFeaturesConfig = {}) {
     this.router = Router();
     this.provider = provider;
     this.options = options;
+    this.app = app;
 
     if (!provider) {
       throw new Error('Provider is required to initialize OGCAPI');
@@ -26,6 +29,11 @@ export class OGCAPI {
   }
 
   setup() {
+
+    if (this.app && !this.app._router?.stack.some((layer: { name: string; }) => layer?.name === 'json')) {
+      this.app.use(express.json({ type: ['application/json', 'application/geo+json'] }));
+      console.log('Dynamically added JSON body parser to app');
+    }
     const root = new RootHandler(this.provider, this.options);
 
     if (!root.isProviderConformed()) {
@@ -59,6 +67,7 @@ export class OGCAPI {
   getRouter() {
     return this.router;
   }
+
 }
 
 export default OGCAPI;

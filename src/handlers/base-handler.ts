@@ -82,6 +82,8 @@ export class BaseHandler {
   setupRoutes(_router: Router): void {
     throw new Error('Must implement setupRoutes in subclass');
   }
+
+  
 }
 
 export default BaseHandler;

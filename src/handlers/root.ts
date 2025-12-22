@@ -49,12 +49,6 @@ export class RootHandler extends BaseHandler {
           title: 'Collections',
         },
         {
-          href: this.buildUrl(req, '/api'),
-          rel: 'service-desc',
-          type: 'application/vnd.oai.openapi+json;version=3.0',
-          title: 'API definition',
-        },
-        {
           href: 'https://docs.ogc.org/is/17-069r4/17-069r4.html',
           rel: 'service-doc',
           type: 'text/html',
@@ -89,12 +83,25 @@ export class RootHandler extends BaseHandler {
     }
   }
 
+  private handleOptionsRequests(_req: Request, res: Response): void {
+    // OGC API Part 4 compliance: Return 200 OK with Allow header listing supported methods
+    res.status(200);
+    const allowMethods = ['GET', 'HEAD', 'OPTIONS'];
+    if (this.provider.enableTransactions) {
+      allowMethods.push('POST', 'PUT', 'PATCH', 'DELETE');
+    }
+    res.set('Allow', allowMethods.join(', '));
+    res.send();
+  }
+  
   setupRoutes(router: Router) {
     // Landing page
     router.get('/', this.handleLandingPage.bind(this));
 
     // Conformance
     router.get('/conformance', this.handleConformance.bind(this));
+    // OPTIONS for root
+    router.options('/', this.handleOptionsRequests.bind(this));
   }
 }
 
