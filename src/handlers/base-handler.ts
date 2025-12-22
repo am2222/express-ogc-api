@@ -1,17 +1,15 @@
 // biome-ignore assist/source/organizeImports: <explanation>
-import type { Request, Response, NextFunction } from 'express';
-import type { Router } from 'express';
-
+import type { Router, Request, Response, NextFunction } from 'express';
+import type { ParsedQs } from 'qs';
 import type { BaseProvider } from '@/providers/base-provider';
 import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 import type { Exception, OGCFeaturesConfig } from '@/types';
 
 export class BaseHandler {
   provider: BaseProvider;
-  requiredCoreClasses: OGCAPIConformanceItem[] = []
+  requiredCoreClasses: OGCAPIConformanceItem[] = [];
   basePath: string = '/';
   options: OGCFeaturesConfig = {};
-
 
   constructor(provider: BaseProvider, options: OGCFeaturesConfig = {}) {
     this.provider = provider;
@@ -24,8 +22,8 @@ export class BaseHandler {
   sendError(res: Response, statusCode: number, message: string): void {
     const exception: Exception = {
       code: statusCode.toString(),
-      description: message
-    }
+      description: message,
+    };
     res.status(statusCode).json(exception);
   }
 
@@ -42,7 +40,7 @@ export class BaseHandler {
     if (!this.provider) {
       return false;
     }
-    if (!this.requiredCoreClasses || this.requiredCoreClasses.length === 0) {
+    if (!this.requiredCoreClasses) {
       throw new Error('requiredCoreClasses is not defined in the handler');
     }
     const providerConformance = this.provider.conformanceClasses();
@@ -51,14 +49,20 @@ export class BaseHandler {
     );
   }
 
-  buildUrl(req: Request, path: string, includeQuery: boolean = false, queryParams: Record<string, string | number | boolean> = {}): string {
+  buildUrl(
+    req: Request,
+    path: string,
+    includeQuery: boolean = false,
+    queryParams: ParsedQs = {}
+  ): string {
     const protocol = req.protocol;
     const host = req.get('host');
     const basePath = this.basePath.replace(/\/+$/, '');
     const baseUrl = `${protocol}://${host}${basePath}${path}`;
 
     // Determine which query parameters to use
-    const paramsToUse = Object.keys(queryParams).length > 0 ? queryParams : req.query;
+    const paramsToUse =
+      Object.keys(queryParams).length > 0 ? queryParams : req.query;
 
     // If includeQuery is true, append query parameters
     if (includeQuery && Object.keys(paramsToUse).length > 0) {
@@ -75,10 +79,9 @@ export class BaseHandler {
     return baseUrl;
   }
 
-
-  setupRoutes(router: Router): void {
+  setupRoutes(_router: Router): void {
     throw new Error('Must implement setupRoutes in subclass');
-  };
+  }
 }
 
 export default BaseHandler;

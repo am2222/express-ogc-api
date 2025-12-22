@@ -1,15 +1,14 @@
-
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 
-import type { Collections, FeatureCollection, LandingPage, Link, OGCFeaturesConfig, QueryParams } from "@/types";
-import type { NextFunction, Request, Response, Router } from "express";
+import type { FeatureCollection, Link, QueryParams } from '@/types';
+import type { NextFunction, Request, Response, Router } from 'express';
 
 export class ItemsCURDHandler extends BaseHandler {
   requiredCoreClasses = [
     OGCAPIConformanceClass.COMMON_CORE,
     OGCAPIConformanceClass.COMMON_LANDING_PAGE,
-    OGCAPIConformanceClass.FEATURES_CORE
+    OGCAPIConformanceClass.FEATURES_CORE,
   ];
 
   private parseQueryParams(req: Request): QueryParams {
@@ -27,16 +26,18 @@ export class ItemsCURDHandler extends BaseHandler {
 
     // Offset
     if (req.query.offset) {
-      params.offset = parseInt(req.query.offset as string, this.provider.defaultOffset) || 0;
+      params.offset =
+        parseInt(req.query.offset as string, this.provider.defaultOffset) || 0;
     }
 
     // Bounding box (Part 1)
     if (req.query.bbox) {
       const bbox = (req.query.bbox as string).split(',').map(Number);
       if (bbox.length === 4 || bbox.length === 6) {
-        params.bbox = bbox.length === 4 
-          ? bbox as [number, number, number, number] 
-          : bbox as [number, number, number, number, number, number];
+        params.bbox =
+          bbox.length === 4
+            ? (bbox as [number, number, number, number])
+            : (bbox as [number, number, number, number, number, number]);
       }
     }
 
@@ -76,7 +77,9 @@ export class ItemsCURDHandler extends BaseHandler {
       params.skipGeometry = req.query['skip-geometry'] === 'true';
     }
     if (req.query['max-allawable-offset']) {
-      params.maxAllowableOffset = parseFloat(req.query['max-allawable-offset'] as string);
+      params.maxAllowableOffset = parseFloat(
+        req.query['max-allawable-offset'] as string
+      );
     }
 
     // Part 8: Sorting
@@ -87,37 +90,57 @@ export class ItemsCURDHandler extends BaseHandler {
     return params;
   }
 
-  private async handleFeatures(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleFeatures(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId } = req.params;
       const params = this.parseQueryParams(req);
 
-      const featureCollection = await this.provider.getFeatures(collectionId, params);
+      const featureCollection = await this.provider.getFeatures(
+        collectionId,
+        params
+      );
 
       const offset = params.offset || 0;
       const limit = params.limit || this.provider.defaultLimit;
       const currentQuery = req.query;
-      const selfUrl = this.buildUrl(req, `/collections/${collectionId}/items`, true, currentQuery);
+      const selfUrl = this.buildUrl(
+        req,
+        `/collections/${collectionId}/items`,
+        true,
+        currentQuery
+      );
 
       const links: Link[] = [
         {
           href: selfUrl,
           rel: 'self',
           type: 'application/geo+json',
-          title: 'This document'
-        }
+          title: 'This document',
+        },
       ];
 
       // Add next link if there are more features
-      if (featureCollection.numberMatched && offset + limit < featureCollection.numberMatched) {
+      if (
+        featureCollection.numberMatched &&
+        offset + limit < featureCollection.numberMatched
+      ) {
         const nextQuery = { ...req.query, offset: (offset + limit).toString() };
-        const nextHref = this.buildUrl(req, `/collections/${collectionId}/items`, true, nextQuery);
+        const nextHref = this.buildUrl(
+          req,
+          `/collections/${collectionId}/items`,
+          true,
+          nextQuery
+        );
 
         links.push({
           href: nextHref,
           rel: 'next',
           type: 'application/geo+json',
-          title: 'Next page'
+          title: 'Next page',
         });
       }
 
@@ -125,19 +148,24 @@ export class ItemsCURDHandler extends BaseHandler {
       if (offset > 0) {
         const prevOffset = Math.max(0, offset - limit);
         const prevQuery = { ...req.query, offset: prevOffset.toString() };
-        const prevHref = this.buildUrl(req, `/collections/${collectionId}/items`, true, prevQuery);
+        const prevHref = this.buildUrl(
+          req,
+          `/collections/${collectionId}/items`,
+          true,
+          prevQuery
+        );
         links.push({
           href: prevHref,
           rel: 'prev',
           type: 'application/geo+json',
-          title: 'Previous page'
+          title: 'Previous page',
         });
       }
 
       const response: FeatureCollection = {
         ...featureCollection,
         links,
-        timeStamp: new Date().toISOString()
+        timeStamp: new Date().toISOString(),
       };
 
       res.json(response);
@@ -146,7 +174,11 @@ export class ItemsCURDHandler extends BaseHandler {
     }
   }
 
-  private async handleFeature(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleFeature(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId, featureId } = req.params;
       const collection = await this.provider.getCollection(collectionId);
@@ -170,7 +202,11 @@ export class ItemsCURDHandler extends BaseHandler {
   }
 
   // Part 3: Filtering endpoints
-  private async handleQueryables(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleQueryables(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId } = req.params;
       const collection = await this.provider.getCollection(collectionId);
@@ -185,9 +221,12 @@ export class ItemsCURDHandler extends BaseHandler {
     }
   }
 
-
   // Part 4: CRUD operations
-  private async handleCreateFeature(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleCreateFeature(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId } = req.params;
       const collection = await this.provider.getCollection(collectionId);
@@ -197,27 +236,38 @@ export class ItemsCURDHandler extends BaseHandler {
       }
       const feature = req.body;
 
-      const created = await this.provider.create(collectionId, feature);
+      const created = await this.provider.createFeature(collectionId, feature);
 
       if (!created) {
-          this.sendError(res, 500, 'Failed to create feature');
+        this.sendError(res, 500, 'Failed to create feature');
         return;
       }
 
-      res.status(201)
-        .location(this.buildUrl(req, `/collections/${collectionId}/items/${created.id}`))
+      res
+        .status(201)
+        .location(
+          this.buildUrl(req, `/collections/${collectionId}/items/${created.id}`)
+        )
         .json(created);
     } catch (err) {
       next(err);
     }
   }
 
-  private async handleReplaceFeature(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleReplaceFeature(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId, featureId } = req.params;
       const feature = req.body;
 
-      const replaced = await this.provider.replace(collectionId, featureId, feature);
+      const replaced = await this.provider.replaceFeature(
+        collectionId,
+        featureId,
+        feature
+      );
 
       if (!replaced) {
         this.sendError(res, 404, 'Feature not found');
@@ -230,12 +280,20 @@ export class ItemsCURDHandler extends BaseHandler {
     }
   }
 
-  private async handleUpdateFeature(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleUpdateFeature(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId, featureId } = req.params;
       const updates = req.body;
 
-      const updated = await this.provider.update(collectionId, featureId, { feature: updates });
+      const updated = await this.provider.updateFeature(
+        collectionId,
+        featureId,
+        { feature: updates }
+      );
 
       if (!updated) {
         this.sendError(res, 404, 'Feature not found');
@@ -248,11 +306,18 @@ export class ItemsCURDHandler extends BaseHandler {
     }
   }
 
-  private async handleDeleteFeature(req: Request, res: Response, next: NextFunction): Promise<void> {
+  private async handleDeleteFeature(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
     try {
       const { collectionId, featureId } = req.params;
 
-      const deleted = await this.provider.delete(collectionId, featureId);
+      const deleted = await this.provider.deleteFeature(
+        collectionId,
+        featureId
+      );
 
       if (!deleted) {
         this.sendError(res, 404, 'Feature not found');
@@ -273,29 +338,51 @@ export class ItemsCURDHandler extends BaseHandler {
       allowMethods.push('POST', 'PUT', 'PATCH', 'DELETE');
     }
     res.set('Allow', allowMethods.join(', '));
-    res.send(); 
+    res.send();
   }
   setupRoutes(router: Router) {
-
-
     // Features - GET
-    router.get('/collections/:collectionId/items', this.handleFeatures.bind(this));
-    router.get('/collections/:collectionId/items/:featureId', this.handleFeature.bind(this));
+    router.get(
+      '/collections/:collectionId/items',
+      this.handleFeatures.bind(this)
+    );
+    router.get(
+      '/collections/:collectionId/items/:featureId',
+      this.handleFeature.bind(this)
+    );
 
     // Part 3: Filtering - Queryables
     if (this.provider.enableFiltering) {
-      router.get('/collections/:collectionId/queryables', this.handleQueryables.bind(this));
+      router.get(
+        '/collections/:collectionId/queryables',
+        this.handleQueryables.bind(this)
+      );
       // router.get('/functions', this.handleFunctions.bind(this));
     }
 
     // Part 4: CRUD operations
     if (this.provider.enableTransactions) {
-      router.post('/collections/:collectionId/items', this.handleCreateFeature.bind(this));
-      router.put('/collections/:collectionId/items/:featureId', this.handleReplaceFeature.bind(this));
-      router.patch('/collections/:collectionId/items/:featureId', this.handleUpdateFeature.bind(this));
-      router.delete('/collections/:collectionId/items/:featureId', this.handleDeleteFeature.bind(this));
+      router.post(
+        '/collections/:collectionId/items',
+        this.handleCreateFeature.bind(this)
+      );
+      router.put(
+        '/collections/:collectionId/items/:featureId',
+        this.handleReplaceFeature.bind(this)
+      );
+      router.patch(
+        '/collections/:collectionId/items/:featureId',
+        this.handleUpdateFeature.bind(this)
+      );
+      router.delete(
+        '/collections/:collectionId/items/:featureId',
+        this.handleDeleteFeature.bind(this)
+      );
 
-      router.options('/collections/:collectionId/items', this.handleOptionsItems.bind(this));
+      router.options(
+        '/collections/:collectionId/items',
+        this.handleOptionsItems.bind(this)
+      );
     }
   }
 }
