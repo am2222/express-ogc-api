@@ -1,7 +1,9 @@
 import { describe, it, beforeAll, afterAll, expect, vi } from 'vitest';
 import { DuckDBInstance } from '@duckdb/node-api';
 import type { DuckDBConnection } from '@duckdb/node-api';
-import { DuckDBProvider } from '../src/index.js';
+import express from 'express';
+import type { AddressInfo } from 'node:net';
+import { DuckDBProvider, OGCAPI, FeatureValidationError } from '../src/index.js';
 import type { ProviderRequest } from '../src/index.js';
 import type { DuckDBLocals } from '../src/index.js';
 
@@ -47,6 +49,35 @@ describe('DuckDBProvider', () => {
         (1, 'London', 9002488, ST_Point(-0.1276, 51.5074)),
         (2, 'Paris',  2161000, ST_Point(2.3522, 48.8566)),
         (3, 'Tokyo', 13960000, ST_Point(139.6917, 35.6895));
+    `);
+
+    // A table exercising constraints `getSchema` should now surface: a real
+    // ENUM column, a NOT NULL column alongside a nullable one, a PRIMARY KEY
+    // (so `x-ogc-role: 'id'` discovery has something unambiguous to find),
+    // and — deliberately — a geometry column named `route`, not `geometry`,
+    // so the `x-ogc-role: 'primary-geometry'` test actually exercises
+    // discovery instead of a hardcoded name.
+    await db.run(`
+      CREATE TYPE surface_kind AS ENUM ('asphalt', 'gravel', 'dirt');
+      CREATE TABLE roads (
+        id INTEGER PRIMARY KEY,
+        name VARCHAR NOT NULL,
+        surface surface_kind,
+        lane_count INTEGER,
+        route GEOMETRY
+      );
+    `);
+    await db.run(`
+      INSERT INTO roads VALUES
+        (1, 'Main St', 'asphalt', 2, ST_Point(0, 0));
+    `);
+
+    // A table with no geometry column at all, for the PUT regression case:
+    // replacing a feature with a geometry against a table that can't accept
+    // one used to 500 with a raw DuckDB Binder Error.
+    await db.run(`
+      CREATE TABLE attributes_only (id INTEGER PRIMARY KEY, label VARCHAR);
+      INSERT INTO attributes_only VALUES (1, 'A');
     `);
 
     provider = new DuckDBProvider({ name: 'DuckDBProvider' });
@@ -131,6 +162,252 @@ describe('DuckDBProvider', () => {
 
     expect(properties.name.type).toBe('string');
     expect(properties.population.type).toBe('integer');
+  });
+
+  it('publishes enum, required, and role constraints from a real DuckDB schema', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'roads');
+    const properties = schema.properties as Record<
+      string,
+      { type: string; enum?: string[]; 'x-ogc-role'?: string }
+    >;
+
+    // ENUM: type + enum array, parsed out of `ENUM('asphalt', 'gravel', 'dirt')`.
+    expect(properties.surface.type).toBe('string');
+    expect(properties.surface.enum).toEqual(['asphalt', 'gravel', 'dirt']);
+
+    // required: exactly the NOT NULL columns (id via PRIMARY KEY, name via
+    // NOT NULL) — nullable columns (surface, lane_count, route) must be
+    // absent, not just "not required due to omission".
+    const required = schema.required as string[];
+    expect(new Set(required)).toEqual(new Set(['id', 'name']));
+    expect(required).not.toContain('surface');
+    expect(required).not.toContain('lane_count');
+    expect(required).not.toContain('route');
+
+    // x-ogc-role: 'primary-geometry' on the *discovered* geometry column —
+    // named `route` here, specifically not `geometry`, so this fails if the
+    // implementation ever assumes the column name instead of discovering it.
+    expect(properties.route['x-ogc-role']).toBe('primary-geometry');
+    expect(properties.surface['x-ogc-role']).toBeUndefined();
+
+    // x-ogc-role: 'id' on the unambiguous identifier column.
+    expect(properties.id['x-ogc-role']).toBe('id');
+
+    expect(schema.$schema).toBe('https://json-schema.org/draft/2019-09/schema');
+    expect(schema.type).toBe('object');
+  });
+
+  it('advertises the Part 5 "Schemas" conformance class', async () => {
+    expect(provider.conformanceClasses()).toContain(
+      'http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/schemas'
+    );
+  });
+
+  it('orders properties with x-ogc-propertySeq matching declaration order, and gives each a title', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'roads');
+    const properties = schema.properties as Record<
+      string,
+      { title?: string; 'x-ogc-propertySeq'?: number }
+    >;
+
+    // `roads` was declared as: id, name, surface, lane_count, route (1-based
+    // ordinal_position). Asserting the exact sequence — not just "some
+    // number" — so this fails if the mapping is ever off by one or reversed.
+    expect(properties.id['x-ogc-propertySeq']).toBe(1);
+    expect(properties.name['x-ogc-propertySeq']).toBe(2);
+    expect(properties.surface['x-ogc-propertySeq']).toBe(3);
+    expect(properties.lane_count['x-ogc-propertySeq']).toBe(4);
+    expect(properties.route['x-ogc-propertySeq']).toBe(5);
+
+    // title: a simple, predictable derivation from the column name —
+    // specifically checking the underscore-splitting case, not just that
+    // *some* string is present.
+    expect(properties.lane_count.title).toBe('Lane Count');
+    expect(properties.id.title).toBe('Id');
+    expect(properties.name.title).toBe('Name');
+  });
+
+  it('serves /schema and /queryables as application/schema+json over real HTTP', async () => {
+    const app = express();
+    app.use((_req, res, next) => {
+      res.locals.db = db;
+      next();
+    });
+    const ogc = new OGCAPI(provider, app, {});
+    app.use(ogc.getRouter());
+
+    const server = app.listen(0);
+    const baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+
+    try {
+      const schemaRes = await fetch(`${baseUrl}/collections/roads/schema`);
+      expect(schemaRes.status).toBe(200);
+      expect(schemaRes.headers.get('content-type')).toMatch(/^application\/schema\+json/);
+
+      const queryablesRes = await fetch(`${baseUrl}/collections/roads/queryables`);
+      expect(queryablesRes.status).toBe(200);
+      expect(queryablesRes.headers.get('content-type')).toMatch(/^application\/schema\+json/);
+    } finally {
+      server.close();
+    }
+  });
+
+  it('omits the enum rather than guessing when a data_type does not parse cleanly as ENUM(...)', async () => {
+    // Exercise the parser directly through the class's private method the
+    // same way the rest of this suite reaches other internals — a
+    // malformed/foreign rendering must yield `undefined` (no `enum` key at
+    // all), never a wrong or partial list.
+    const parse = (provider as unknown as { parseEnumValues(t: string): string[] | undefined })
+      .parseEnumValues.bind(provider);
+
+    expect(parse("ENUM('a', 'b'")).toBeUndefined(); // unterminated
+    expect(parse("ENUM(a, b)")).toBeUndefined(); // not quoted
+    expect(parse("ENUM('a' 'b')")).toBeUndefined(); // missing comma
+    expect(parse("VARCHAR")).toBeUndefined(); // not an enum at all
+    // Values containing a quote and a comma round-trip correctly.
+    expect(parse("ENUM('has''quote', 'has,comma')")).toEqual(["has'quote", 'has,comma']);
+  });
+
+  it('reports maxLength when DuckDB provides a character_maximum_length', async () => {
+    // Verified against both the `@duckdb/node-api` binding and the `duckdb`
+    // CLI (v1.5.1): DuckDB parses and discards a VARCHAR(n)/CHAR(n) length
+    // at DDL time and `character_maximum_length` is always NULL in
+    // `information_schema.columns` — there is no way to make a real DuckDB
+    // table report a non-null value here. This test proves the mapping
+    // logic is correct given a value DuckDB *could* supply, by intercepting
+    // just the one query `getSchema` uses to read column metadata and
+    // otherwise letting every other query (geometry-column discovery, id
+    // discovery) run for real.
+    const original = db.runAndReadAll.bind(db);
+    const spy = vi.spyOn(db, 'runAndReadAll').mockImplementation(async (...args: any[]) => {
+      const reader = await (original as any)(...args);
+      const sql = args[0];
+      if (typeof sql === 'string' && sql.includes('character_maximum_length') && sql.includes('is_nullable')) {
+        const rows = reader.getRowObjectsJS().map((row: Record<string, unknown>) =>
+          row['column_name'] === 'name' ? { ...row, character_maximum_length: 50 } : row
+        );
+        return { getRowObjectsJS: () => rows } as any;
+      }
+      return reader;
+    });
+
+    const schema = await provider.getSchema(fakeReq(db), 'roads');
+    spy.mockRestore();
+
+    const properties = schema.properties as Record<string, { maxLength?: number }>;
+    expect(properties.name.maxLength).toBe(50);
+    // A column DuckDB didn't report a length for must not get a guessed one.
+    expect(properties.surface.maxLength).toBeUndefined();
+  });
+
+  it('maps a POINT-family DuckDB type to "object", not "integer" (mapDuckDBTypeToJSON substring bug)', async () => {
+    await db.run(`CREATE TABLE point_types (id INTEGER PRIMARY KEY, location POINT_2D);`);
+
+    const schema = await provider.getSchema(fakeReq(db), 'point_types');
+    const properties = schema.properties as Record<string, { type: string }>;
+
+    // 'POINT_2D'.includes('INT') is true, so before the fix this reported
+    // 'integer'.
+    expect(properties.location.type).toBe('object');
+  });
+
+  it('rejects an invalid enum value with a translated error, not the raw DuckDB one', async () => {
+    let caught: unknown;
+    try {
+      await provider.createFeature(fakeReq(db), 'roads', {
+        type: 'Feature',
+        id: 900,
+        geometry: null,
+        properties: { id: 900, name: 'Bad Road', surface: 'concrete', lane_count: 1 },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.property).toBe('surface');
+    // The whole point: DuckDB's own wording (the enum's physical storage
+    // type) must not reach the message.
+    expect(err.message).not.toContain('UINT8');
+    expect(err.message).not.toContain('Conversion Error');
+    expect(err.message).toContain('surface');
+    // The original DuckDB error is preserved for server-side logs.
+    expect(String((err.cause as Error)?.message)).toContain('UINT8');
+  });
+
+  it('maps a NOT NULL violation to a translated 400 naming the property', async () => {
+    let caught: unknown;
+    try {
+      await provider.createFeature(fakeReq(db), 'roads', {
+        type: 'Feature',
+        id: 901,
+        geometry: null,
+        // `name` is NOT NULL and omitted here.
+        properties: { id: 901, surface: 'asphalt' },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.property).toBe('name');
+    expect(err.message).not.toContain('Constraint Error');
+  });
+
+  it('maps a PUT with a geometry against a table with no geometry column to 400, not 500 (regression)', async () => {
+    let caught: unknown;
+    try {
+      await provider.replaceFeature(fakeReq(db), 'attributes_only', '1', {
+        type: 'Feature',
+        id: 1,
+        geometry: { type: 'Point', coordinates: [1, 2] },
+        properties: { label: 'B' },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.message).not.toContain('Binder Error');
+    expect(err.message).not.toContain('not found in table');
+  });
+
+  it('rejects an invalid enum value as a 400 over real HTTP, not a 500 mentioning UINT8', async () => {
+    const app = express();
+    app.use((_req, res, next) => {
+      res.locals.db = db;
+      next();
+    });
+    const ogc = new OGCAPI(provider, app, {});
+    app.use(ogc.getRouter());
+
+    const server = app.listen(0);
+    const baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+
+    try {
+      const res = await fetch(`${baseUrl}/collections/roads/items`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/geo+json' },
+        body: JSON.stringify({
+          type: 'Feature',
+          geometry: null,
+          properties: { id: 902, name: 'HTTP Bad Road', surface: 'concrete', lane_count: 1 },
+        }),
+      });
+      const body = (await res.json()) as { code: string; description: string };
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(body)).not.toContain('UINT8');
+      expect(body.description).toContain('surface');
+    } finally {
+      server.close();
+    }
   });
 
   it('creates, updates and deletes a feature', async () => {

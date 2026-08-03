@@ -8,7 +8,7 @@ import type {
   QueryParams,
   UpdateFeatureParams,
 } from '@/types';
-import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
+import { OGCAPIConformanceClass, type OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 
 export interface ProviderDef {
   name: string;
@@ -85,6 +85,35 @@ export abstract class BaseProvider<
     } else {
       this.enableTransactions = false;
     }
+  }
+
+  /**
+   * The Part 5 "Schemas" conformance class to fold into a subclass's
+   * `conformanceClasses()`, tied to the `enableSchemas` flag this class
+   * already computes (rather than each provider hand-listing the class
+   * literal and letting it drift out of sync with whether `getSchema` is
+   * actually meaningfully implemented). Returns an empty array when
+   * `enableSchemas` is false, so `[...classes, ...this.schemaConformanceClasses()]`
+   * is always safe to spread.
+   */
+  protected schemaConformanceClasses(): OGCAPIConformanceItem[] {
+    return this.enableSchemas ? [OGCAPIConformanceClass.FEATURES_SCHEMAS] : [];
+  }
+
+  /**
+   * Derive a human-readable field alias from a column/property name for the
+   * `title` schema keyword (QGIS uses this as the field's alias in its
+   * attribute table). Kept deliberately simple and predictable: split on
+   * `_`/`-`, capitalize the first letter of each resulting word, and join
+   * with a space — no acronym handling, no camelCase splitting.
+   * `founded_year` -> `Founded Year`; `id` -> `Id`.
+   */
+  protected titleFromColumnName(name: string): string {
+    return name
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
   }
 
   abstract getSchema(

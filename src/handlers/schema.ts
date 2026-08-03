@@ -13,7 +13,7 @@ export class RootHandler extends BaseHandler {
     try {
       const { collectionId } = req.params;
       const schema = await this.provider.getSchema(req as ProviderRequest, collectionId);
-      res.json(schema);
+      res.type('application/schema+json').json(schema);
     } catch (err) {
       next(err);
     }

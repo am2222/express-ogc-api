@@ -1,8 +1,13 @@
 # express-ogc-api
 
+[![CI](https://github.com/am2222/express-ogc-api/actions/workflows/ci.yml/badge.svg)](https://github.com/am2222/express-ogc-api/actions/workflows/ci.yml)
+[![Release](https://github.com/am2222/express-ogc-api/actions/workflows/release.yml/badge.svg)](https://github.com/am2222/express-ogc-api/actions/workflows/release.yml)
+[![npm version](https://img.shields.io/npm/v/express-ogc-api.svg)](https://www.npmjs.com/package/express-ogc-api)
+[![npm downloads](https://img.shields.io/npm/dm/express-ogc-api.svg)](https://www.npmjs.com/package/express-ogc-api)
+[![provenance](https://img.shields.io/badge/provenance-attested-brightgreen.svg)](https://docs.npmjs.com/generating-provenance-statements)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.9-blue.svg)](https://www.typescriptlang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-18+-green.svg)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/Node.js-20+-green.svg)](https://nodejs.org/)
 
 Modern Express.js middleware for implementing [OGC API Features](https://ogcapi.ogc.org/features/) standards with full TypeScript support.
 
@@ -13,7 +18,8 @@ Modern Express.js middleware for implementing [OGC API Features](https://ogcapi.
 📦 **Extensible** - Provider-based architecture for custom data sources  
 🌍 **Standards-compliant** - Implements OGC API Features and Common standards  
 🔧 **Feature-rich** - Supports filtering, sorting, schemas, and CRUD operations  
-💾 **In-Memory Provider** - Built-in provider for quick prototyping
+💾 **In-Memory Provider** - Built-in provider for quick prototyping  
+🦆 **DuckDB Provider** - Serve a DuckDB database directly, with CQL2 pushed down to SQL
 
 ## Installation
 
@@ -79,28 +85,28 @@ app.listen(3000, () => {
 The middleware automatically creates the following OGC API endpoints:
 
 ### Core Endpoints
-- **\`GET /\`** - Landing page with API links
-- **\`GET /conformance\`** - Conformance declaration
-- **\`GET /api\`** - OpenAPI 3.0 definition of this API
-- **\`OPTIONS *\`** - Allowed methods for any path, via the \`Allow\` header
-- **\`GET /collections\`** - List of collections
-- **\`GET /collections/{collectionId}\`** - Collection metadata
+- **`GET /`** - Landing page with API links
+- **`GET /conformance`** - Conformance declaration
+- **`GET /api`** - OpenAPI 3.0 definition of this API
+- **`OPTIONS *`** - Allowed methods for any path, via the `Allow` header
+- **`GET /collections`** - List of collections
+- **`GET /collections/{collectionId}`** - Collection metadata
 
 ### Feature Endpoints
-- **\`GET /collections/{collectionId}/items\`** - Get features from a collection
-- **\`GET /collections/{collectionId}/items/{featureId}\`** - Get a specific feature
+- **`GET /collections/{collectionId}/items`** - Get features from a collection
+- **`GET /collections/{collectionId}/items/{featureId}`** - Get a specific feature
 
 ### Schema Endpoints (if provider supports schemas)
-- **\`GET /collections/{collectionId}/schema\`** - JSON Schema for collection features
+- **`GET /collections/{collectionId}/schema`** - JSON Schema for collection features
 
 ### Queryables (if provider supports filtering)
-- **\`GET /collections/{collectionId}/queryables\`** - Queryable properties
+- **`GET /collections/{collectionId}/queryables`** - Queryable properties
 
 ### CRUD Operations (if provider supports transactions)
-- **\`POST /collections/{collectionId}/items\`** - Create a new feature
-- **\`PUT /collections/{collectionId}/items/{featureId}\`** - Replace a feature
-- **\`PATCH /collections/{collectionId}/items/{featureId}\`** - Update a feature
-- **\`DELETE /collections/{collectionId}/items/{featureId}\`** - Delete a feature
+- **`POST /collections/{collectionId}/items`** - Create a new feature
+- **`PUT /collections/{collectionId}/items/{featureId}`** - Replace a feature
+- **`PATCH /collections/{collectionId}/items/{featureId}`** - Update a feature
+- **`DELETE /collections/{collectionId}/items/{featureId}`** - Delete a feature
 
 ## Configuration
 
@@ -111,9 +117,9 @@ new OGCAPI(provider: BaseProvider<any, any>, app: Application, options?: OGCFeat
 ```
 
 **Parameters:**
-- \`provider\` - An instance of \`BaseProvider\` or its subclass (e.g., \`InMemoryProvider\`)
-- \`app\` - The Express application; used to detect an existing JSON body parser before mounting its own
-- \`options\` - Optional configuration object
+- `provider` - An instance of `BaseProvider` or its subclass (e.g., `InMemoryProvider`)
+- `app` - The Express application; used to detect an existing JSON body parser before mounting its own
+- `options` - Optional configuration object
 
 ### Configuration Options
 
@@ -175,13 +181,188 @@ provider.addFeature('cities', {
 });
 ```
 
+### DuckDBProvider
+
+Serves an existing [DuckDB](https://duckdb.org/) database over OGC API - Features.
+Unlike `InMemoryProvider`, you don't register collections or features: the
+provider reads `information_schema` and **every table becomes a collection**,
+named after itself. Schemas, CQL2 filtering and transactions are all enabled.
+
+```typescript
+import express from 'express';
+import { DuckDBInstance } from '@duckdb/node-api';
+import { OGCAPI, DuckDBProvider } from 'express-ogc-api';
+
+// 1. Your application owns the connection — it opens it, loads the extensions
+//    it needs, and closes it. The provider only borrows it, per request.
+const instance = await DuckDBInstance.create('./cities.duckdb');
+const db = await instance.connect();
+await db.run('INSTALL spatial; LOAD spatial;');
+
+const app = express();
+const provider = new DuckDBProvider({ name: 'DuckDBProvider' });
+const ogcAPI = new OGCAPI(provider, app, { title: 'Cities API' });
+
+// 2. Hand the connection to the provider through res.locals.db. This is the
+//    whole contract — plain Express middleware, no library hooks.
+app.use('/ogc', (_req, res, next) => {
+  res.locals.db = db;
+  next();
+});
+
+app.use('/ogc', ogcAPI.getRouter());
+app.listen(3000);
+```
+
+That's the entire integration. `GET /ogc/collections` now lists your tables.
+
+#### The connection contract
+
+The provider **never opens, owns, or closes a database**. It calls
+`res.locals.db` on each request and borrows the connection for the duration of
+the call. Consequences worth knowing:
+
+- You control pooling, lifetime and shutdown.
+- You choose which extensions are loaded — the provider assumes none.
+- Different requests can be served by different connections (this is what makes
+  per-tenant and per-database routing possible).
+- If `res.locals.db` is missing, the request fails with an explicit
+  `no connection found at res.locals.db` error rather than a `TypeError`.
+
+#### What gets discovered automatically
+
+| Discovered | How | Notes |
+|---|---|---|
+| Collections | every table in `current_schema()` | one collection per table |
+| Geometry column | first column whose type matches `GEOMETRY` | name is irrelevant — `geom` and `wkb_geometry` both work, so GDAL/shapefile imports need no renaming |
+| Feature id | an `id` or `fid` column | only these two names are recognised |
+| Spatial extent | `ST_Extent` over the geometry column | widened type match, so specific types like `POINT` are found too |
+| Property schema | column names and types | drives `/schema` and `/queryables` |
+
+A table **must have an `id` or `fid` column** to be readable per-feature —
+without one, `/items/{featureId}` raises
+`Collection has no 'id' or 'fid' column to identify features by`.
+
+#### Supported query parameters
+
+`DuckDBProvider` pushes down only these, as SQL:
+
+| Parameter | Status | How |
+|---|---|---|
+| `limit` | ✅ | `LIMIT`, capped at the provider's `maxLimit` |
+| `offset` | ✅ | `OFFSET` |
+| `bbox` | ✅ | `ST_Intersects` against `ST_MakeEnvelope` (needs the `spatial` extension) |
+| `filter` / `filter-lang` | ⚠️ **ignored** | see below |
+| `sortby` | ⚠️ **ignored** | — |
+| `properties` | ⚠️ **ignored** | — |
+| `skip-geometry` | ⚠️ **ignored** | — |
+| `datetime` | ⚠️ **ignored** | — |
+
+> [!WARNING]
+> The ignored parameters are accepted and then **silently dropped** — the request
+> returns `200` with *unfiltered, unsorted* data rather than an error. Because
+> `DuckDBProvider` declares `enableFiltering`, `/queryables` is advertised and a
+> `filter` is accepted, so a client has every reason to believe filtering
+> happened. Do not rely on any of them for correctness or access control with
+> this provider yet.
+
+`Cql2ToSql` — the CQL2 → parameterised-SQL translator documented under
+[CQL2 Filtering](#cql2-filtering) — is fully implemented and exported, but
+`DuckDBProvider.getFeatures` does not currently call it. You can wire it in
+yourself by overriding `getFeatures`, or use it directly for your own queries.
+`InMemoryProvider`, by contrast, does implement `filter`, `sortby`, `properties`
+and `skip-geometry`.
+
+#### Mapping collection ids to table names
+
+By default a collection id *is* a table name. Two `protected` hooks change that,
+and they **must be exact inverses**:
+
+```typescript
+protected physicalTableName(req, collectionId): string        // id  -> table
+protected collectionIdForTable(req, tableName): string | null  // table -> id (null hides it)
+```
+
+Every table reference and every `information_schema` lookup goes through
+`physicalTableName`, and discovery maps each table through
+`collectionIdForTable`, dropping every `null`. Breaking the symmetry is not a
+cosmetic bug: discovery can advertise ids that reads then 404 on, or — the
+security-relevant direction — a crafted collection id can resolve to a table the
+request should not reach.
+
+#### Multi-tenancy
+
+Tenancy is deliberately **not** in the library. `examples/prefixed-duckdb-provider.ts`
+is a copyable ~40-line subclass implementing the common approach: prefix physical
+tables with a per-request key, so tenant `demo` sees `demo_points` as the
+collection `points` and the prefix never appears in a URL.
+
+```typescript
+app.use('/root/:dbid', (req, res, next) => {
+  if (!KNOWN_TENANTS.has(req.params.dbid)) {
+    res.status(404).json({ code: '404', description: 'Unknown database' });
+    return;
+  }
+  res.locals.db = db;
+  res.locals.key = req.params.dbid;   // PrefixedDuckDBProvider reads this
+  next();
+});
+
+app.use('/root/:dbid', ogcAPI.getRouter());
+```
+
+Because links follow the mount path, a parametrized mount needs no `basePath`.
+Read that example before adapting it — it documents why the tenant key rejects
+underscores (they separate key from collection id, so allowing them lets one
+tenant's prefix collide with another's) and why a missing key throws instead of
+quietly falling back to unprefixed tables.
+
+#### Running the bundled examples
+
+The `examples/` directory is not published to npm — clone the repo to run these.
+
+| File | What it does |
+|---|---|
+| `example-memory-provider.ts` | `InMemoryProvider`, no database needed |
+| `example-duckdb-provider.ts` | Builds an **in-memory** DuckDB seeded with cities, parks and roads for two tenants (`db1`, `db2`), then serves it |
+| `build-demo-duckdb.ts` | Writes a **persistent** `examples/demo.duckdb` — points, lines and polygons around Prospect Park, Brooklyn |
+| `serve-demo.ts` | Serves `demo.duckdb`, with a request log, for testing in a real GIS client |
+
+```bash
+npm install
+
+# In-memory, multi-tenant demo on :3001 — try /root/db1 and /root/db2
+npm run example
+
+# Or the persistent file, for QGIS testing on :3005
+npx tsx examples/build-demo-duckdb.ts
+npx tsx examples/serve-demo.ts
+```
+
+To open it in **QGIS**: Layer → Add Layer → Add WFS / OGC API - Features Layer,
+create a new connection pointing at the landing page the server prints
+(`http://localhost:3005/root/demo`), then connect. The three demo layers overlap
+in one view, which makes the geometry easy to sanity-check.
+
+#### Notes and limitations
+
+- **Load the `spatial` extension yourself** (`INSTALL spatial; LOAD spatial;`)
+  before any request using `bbox` or a spatial CQL2 operator.
+- `BIGINT`/`UBIGINT`/`HUGEINT` come back from DuckDB as JS `bigint`, which
+  `JSON.stringify` cannot serialize. The provider converts them: to `number`
+  within the safe-integer range, otherwise to a decimal string.
+- Only `id` and `fid` are recognised as identity columns.
+- `getCollections` is memoised per request in a `WeakMap` keyed by the response,
+  so a single request never scans the catalog twice and nothing outlives the
+  request. Single-collection reads skip discovery entirely.
+
 ### Custom Providers
 
-Extend \`BaseProvider\` to create custom data sources. Provider methods that run
+Extend `BaseProvider` to create custom data sources. Provider methods that run
 inside a request receive the Express request first, typed through
-\`ProviderRequest<TParams, TLocals>\` — \`TParams\` describes \`req.params\` (for
-example the tenant id from a parametrized mount), and \`TLocals\` describes
-whatever your own middleware attaches to \`req.res.locals\`:
+`ProviderRequest<TParams, TLocals>` — `TParams` describes `req.params` (for
+example the tenant id from a parametrized mount), and `TLocals` describes
+whatever your own middleware attaches to `req.res.locals`:
 
 ```typescript
 import { BaseProvider, OGCAPIConformanceClass } from 'express-ogc-api';
@@ -223,19 +404,23 @@ class MyCustomProvider extends BaseProvider<MyParams, MyLocals> {
 
 ## Query Parameters
 
-The following OGC API query parameters are supported (when provider enables them):
+The following OGC API query parameters are parsed from the request and passed to
+the provider as `QueryParams`. **Whether each one takes effect is up to the
+provider** — `InMemoryProvider` implements all of them, while `DuckDBProvider`
+currently honours only `limit`, `offset` and `bbox` (see
+[Supported query parameters](#supported-query-parameters)):
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| \`limit\` | number | Maximum number of features to return |
-| \`offset\` | number | Starting position for pagination |
-| \`bbox\` | string | Bounding box filter (minx,miny,maxx,maxy) |
-| \`datetime\` | string | Temporal filter (ISO 8601) |
-| \`filter\` | string | CQL2 filter expression |
-| \`filter-lang\` | string | Filter language (e.g., 'cql2-text') |
-| \`sortby\` | string | Sort by properties (+prop or -prop) |
-| \`properties\` | string | Comma-separated list of properties to return |
-| \`skip-geometry\` | boolean | Skip geometry in response |
+| `limit` | number | Maximum number of features to return |
+| `offset` | number | Starting position for pagination |
+| `bbox` | string | Bounding box filter (minx,miny,maxx,maxy) |
+| `datetime` | string | Temporal filter (ISO 8601) |
+| `filter` | string | CQL2 filter expression |
+| `filter-lang` | string | Filter language (e.g., 'cql2-text') |
+| `sortby` | string | Sort by properties (+prop or -prop) |
+| `properties` | string | Comma-separated list of properties to return |
+| `skip-geometry` | boolean | Skip geometry in response |
 
 ## CQL2 Filtering
 
@@ -350,28 +535,52 @@ generated SQL is DuckDB-flavoured regardless.
 Full TypeScript support with comprehensive type definitions:
 
 ```typescript
-import { 
-  OGCAPI, 
+import {
+  OGCAPI,
   InMemoryProvider,
+  DuckDBProvider,
   BaseProvider,
-  OGCFeaturesConfig,
+  Cql2ToSql,
   OGCAPIConformanceClass,
+} from 'express-ogc-api';
+
+import type {
+  OGCFeaturesConfig,
+  ProviderRequest,
+  DuckDBLocals,
   Feature,
   FeatureCollection,
   Collection,
-  QueryParams
+  Queryable,
+  QueryParams,
+  UpdateFeatureParams,
 } from 'express-ogc-api';
 ```
 
+`Feature` and `FeatureCollection` build on [`@types/geojson`](https://www.npmjs.com/package/@types/geojson),
+so `geometry` is a proper discriminated union rather than `any` — narrowing on
+`geometry.type` gives you typed `coordinates`:
+
+```typescript
+if (feature.geometry?.type === 'Point') {
+  const [lon, lat] = feature.geometry.coordinates;  // typed [number, number]
+}
+```
+
+`geometry` is `Geometry | null`, because RFC 7946 permits unlocated features and
+that is also what `skip-geometry` returns. `Queryable` extends `JSONSchema7`.
+
 ## Conformance Classes
 
-The \`InMemoryProvider\` implements the following OGC API conformance classes:
+Both `InMemoryProvider` and `DuckDBProvider` declare the following OGC API
+conformance classes, and `DuckDBProvider` adds the Features **schemas** class on
+top (it sets `enableSchemas`):
 
-- \`http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core\`
-- \`http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page\`
-- \`http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/json\`
-- \`http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core\`
-- \`http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson\`
+- `http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/core`
+- `http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/landing-page`
+- `http://www.opengis.net/spec/ogcapi-common-1/1.0/conf/json`
+- `http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/core`
+- `http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/geojson`
 
 ## Development
 
@@ -379,10 +588,14 @@ The \`InMemoryProvider\` implements the following OGC API conformance classes:
 # Install dependencies
 npm install
 
-# Build the project
+# Typecheck without emitting
+npm run typecheck
+
+# Build the project (tsc, then tsc-alias to rewrite @/* paths and add
+# the .js extensions Node's ESM resolver requires)
 npm run build
 
-# Run tests
+# Run tests once
 npm test
 
 # Run tests in watch mode
@@ -403,8 +616,8 @@ npm run format
 
 ## Requirements
 
-- Node.js >= 18.0.0
-- Express.js >= 4.18.0 or >= 5.0.0
+- Node.js >= 20.0.0
+- Express.js >= 4.18.0 or >= 5.0.0 (a peer dependency — install it yourself)
 
 ## Standards
 
@@ -423,14 +636,14 @@ Providing:
 
 ## Migrating
 
-**Provider methods now take the Express request first.** \`getCollections\`,
-\`getCollection\`, \`getFeatures\`, \`getFeature\`, \`getSchema\`, \`getQueryables\`,
-\`createFeature\`, \`replaceFeature\`, \`updateFeature\` and \`deleteFeature\` all gained
-a leading \`req\` parameter. \`conformanceClasses\`, \`addCollection\` and \`addFeature\`
+**Provider methods now take the Express request first.** `getCollections`,
+`getCollection`, `getFeatures`, `getFeature`, `getSchema`, `getQueryables`,
+`createFeature`, `replaceFeature`, `updateFeature` and `deleteFeature` all gained
+a leading `req` parameter. `conformanceClasses`, `addCollection` and `addFeature`
 are unchanged — they run outside a request. If a provider calls its own methods
-internally, thread \`req\` through those calls too.
+internally, thread `req` through those calls too.
 
-**\`preProviderHook\` / \`postProviderHook\` / \`setupProviderHooks\` are gone.** Use
+**`preProviderHook` / `postProviderHook` / `setupProviderHooks` are gone.** Use
 Express directly:
 
 ```typescript
@@ -443,9 +656,33 @@ app.use((req, res, next) => {
 });
 ```
 
-**\`basePath\` is now an override, not the mount path.** If you set it to the same
+**`basePath` is now an override, not the mount path.** If you set it to the same
 value you mount at, nothing changes and you can delete it. Do not set it when
 mounting at a parametrized path — it cannot know the resolved param values.
+
+## Releasing
+
+Releases are automated, and the two GitHub Actions badges at the top of this file
+track the two halves of it:
+
+- **CI** — runs on every push and pull request: typecheck, tests on Node 20, 22
+  and 24, a build, and an import of the built `dist/index.js` (a green typecheck
+  does not prove the emitted package actually loads).
+- **Release** — runs on pushes to `main`.
+  [release-please](https://github.com/googleapis/release-please) reads
+  [Conventional Commit](https://www.conventionalcommits.org/) messages and keeps a
+  release pull request open with the pending version bump and changelog. Merging
+  that PR tags the release and publishes to npm.
+
+Publishing uses [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
+over GitHub's OIDC — there is no npm token stored in this repository. npm verifies
+the workflow identity and issues a short-lived credential, and every release
+carries an automatically generated
+[provenance attestation](https://docs.npmjs.com/generating-provenance-statements)
+linking the published tarball to the exact commit and workflow run that built it.
+
+So commit messages decide versions: `fix:` → patch, `feat:` → minor, and a
+`feat!:` or `BREAKING CHANGE:` footer → major.
 
 ## License
 

@@ -130,6 +130,57 @@ describe('OGC API LandingPage', () => {
     expect(data.conformsTo.length).toBeGreaterThan(0);
   });
 
+  // QGIS's OGC API - Features provider (3.44+, PR #61119) only ever fetches
+  // GET /collections/{id}/schema when /conformance advertises this exact
+  // class. Without it, everything `getSchema` publishes is invisible to
+  // QGIS regardless of what the collection's link relation says.
+  it('advertises the Part 5 "Schemas" conformance class', async () => {
+    const response = await fetch(`${baseUrl}/ogc/conformance`);
+    const data = (await response.json()) as { conformsTo: string[] };
+
+    expect(data.conformsTo).toContain(
+      'http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/schemas'
+    );
+  });
+
+  it('serves the schema endpoint as application/schema+json, not application/json', async () => {
+    const response = await fetch(`${baseUrl}/ogc/collections/cities/schema`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toMatch(/^application\/schema\+json/);
+  });
+
+  it('serves the queryables endpoint as application/schema+json, not application/json', async () => {
+    const response = await fetch(`${baseUrl}/ogc/collections/cities/queryables`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toMatch(/^application\/schema\+json/);
+  });
+
+  // Regression guard: adding a conformance class to the array `conformance
+  // Classes()` returns must not change which handlers register their routes
+  // — `RootHandler`/`CollectionHandler`/`ItemsCURDHandler`/`SchemaHandler`
+  // each gate registration on `isProviderConformed()`, and none of their
+  // `requiredCoreClasses` lists (nor the schema handler's `enableSchemas`
+  // check) depend on the new class being absent. If any of these gates
+  // regressed, one of the following would 404 instead of 200.
+  it('still registers every route after adding the schemas conformance class (regression guard)', async () => {
+    const endpoints = [
+      '/ogc',
+      '/ogc/conformance',
+      '/ogc/collections',
+      '/ogc/collections/cities',
+      '/ogc/collections/cities/items',
+      '/ogc/collections/cities/items/sf',
+      '/ogc/collections/cities/queryables',
+      '/ogc/collections/cities/schema',
+    ];
+
+    for (const endpoint of endpoints) {
+      const response = await fetch(`${baseUrl}${endpoint}`);
+      expect(response.status, `GET ${endpoint}`).toBe(200);
+    }
+  });
 
   it('should set CORS headers', async () => {
     const response = await fetch(`${baseUrl}/ogc`, { method: 'OPTIONS' });

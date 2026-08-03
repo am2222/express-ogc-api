@@ -12,6 +12,13 @@
  * demo_polygons — so tenant `demo` exposes collections `points`, `lines` and
  * `polygons`. The prefix never appears in a URL.
  *
+ * Every route is behind a JWT carried in the URL path: `/:token/ogc/...`. The
+ * token's `db` claim selects the tenant, so the database id never appears in
+ * the URL either — the token is what grants access to `demo`. An invalid,
+ * tampered-with, or expired token gets a 403. The server prints a freshly
+ * signed 8h token on startup; see `examples/demo-jwt.ts` for the signing and
+ * verification, and `examples/mint-token.ts` to mint more.
+ *
  * In QGIS: Layer > Add Layer > Add WFS / OGC API - Features Layer, create a
  * new connection pointing at the landing page printed on startup.
  */
@@ -22,6 +29,7 @@ import express from 'express';
 import { DuckDBInstance } from '@duckdb/node-api';
 import { OGCAPI } from '../src/index.js';
 import { PrefixedDuckDBProvider } from './prefixed-duckdb-provider.js';
+import { getToken, requireToken, TOKEN_TTL } from './demo-jwt.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(here, 'demo.duckdb');
@@ -45,29 +53,62 @@ const ogcAPI = new OGCAPI(provider, app, {
   description: 'Points, lines and polygons from a local DuckDB file',
 });
 
-// Plain Express middleware — no library hooks involved. It resolves the tenant
-// and puts the connection and the key where the provider looks for them.
-app.use('/root/:dbid', (req, res, next) => {
-  if (!KNOWN_TENANTS.has(req.params.dbid)) {
-    res.status(404).json({
-      code: '404',
-      description: `Unknown database ${req.params.dbid}`,
-    });
-    return;
-  }
-  res.locals.db = db;
-  res.locals.key = req.params.dbid;
+// Tokens are long and, more importantly, they are credentials — a full token
+// in a log line is a copy-pasteable key. Collapse it to `<token>` so the log
+// stays readable and doesn't hand out access to anyone reading the console.
+function redactToken(url: string): string {
+  return url.replace(/^\/[^/]+\/ogc\b/, '/<token>/ogc');
+}
+
+// Request log, so you can see exactly what a client (e.g. QGIS) asks for —
+// in particular whether it ever fetches /schema, and whether it issues any
+// write requests. Logged on 'finish' so the status code is known.
+app.use((req, res, next) => {
+  const started = Date.now();
+  res.on('finish', () => {
+    const line = `${req.method} ${redactToken(req.originalUrl)} -> ${res.statusCode} (${Date.now() - started}ms)`;
+    const accept = req.get('accept');
+    console.log(accept ? `${line}  accept: ${accept}` : line);
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body) {
+      console.log(`   body: ${JSON.stringify(req.body).slice(0, 400)}`);
+    }
+  });
   next();
 });
 
-app.use('/root/:dbid', ogcAPI.getRouter());
+// Plain Express middleware — no library hooks involved.
+//
+// First gate: verify the token in the path and resolve the tenant from its
+// `db` claim onto res.locals.key. Rejects with 403 before anything touches the
+// database.
+app.use('/:token/ogc', requireToken(KNOWN_TENANTS));
+
+// Then hand the provider the connection it borrows for this request. Only
+// reached once the token verified, so an unauthenticated request never gets
+// this far.
+app.use('/:token/ogc', (_req, res, next) => {
+  res.locals.db = db;
+  next();
+});
+
+// The router is mounted under the token segment, so req.baseUrl is
+// `/<token>/ogc` and every link the library generates keeps the token in it —
+// a client that starts from the landing page can crawl the whole API without
+// ever needing to re-attach the token itself.
+app.use('/:token/ogc', ogcAPI.getRouter());
 
 app.use('/', (_req, res) => {
-  res.send('Demo OGC API - Features. Landing page: /root/demo');
+  res.send(
+    'Demo OGC API - Features. Landing page: /<token>/ogc — mint a token with: npx tsx examples/mint-token.ts demo'
+  );
 });
 
 const server = app.listen(port, () => {
-  const base = `http://localhost:${port}/root/demo`;
+  // A fresh token each boot, so the printed URLs are always usable. Restarting
+  // the server invalidates nothing (the old token stays valid until it
+  // expires) — it just issues another one.
+  const token = getToken({ db: 'demo', sub: 'demo-user' });
+  const base = `http://localhost:${port}/${token}/ogc`;
   console.log('🌍 Demo OGC API - Features server');
   console.log('================================');
   console.log(`  Landing page (use this in QGIS):  ${base}`);
@@ -76,6 +117,9 @@ const server = app.listen(port, () => {
   console.log(`  Points:                           ${base}/collections/points/items`);
   console.log(`  Lines:                            ${base}/collections/lines/items`);
   console.log(`  Polygons:                         ${base}/collections/polygons/items`);
+  console.log('');
+  console.log(`  Token expires in ${TOKEN_TTL}. Mint another:  npx tsx examples/mint-token.ts demo`);
+  console.log('  A bad, tampered-with or expired token gets 403 Invalid or expired token.');
   console.log('');
   console.log('Press Ctrl+C to stop');
 });

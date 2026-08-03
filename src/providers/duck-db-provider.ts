@@ -10,8 +10,10 @@ import type {
     QueryParams,
     UpdateFeatureParams,
 } from '@/types';
+import type { Geometry } from 'geojson';
 import { OGCAPIConformanceItem, OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 import { BaseProvider, type ProviderDef } from '@/providers/base-provider';
+import { FeatureValidationError } from '@/errors';
 
 export interface DuckDBLocals {
     db: DuckDBConnection;
@@ -206,10 +208,14 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             delete properties[geometryColumn];
         }
 
-        let geometry: unknown = null;
+        // The cast is sound by construction: `__geometry_json` is only ever
+        // projected as `ST_AsGeoJSON(...)`, whose output is a GeoJSON geometry
+        // object. A parse failure leaves the feature unlocated (`null`) rather
+        // than propagating a half-parsed value.
+        let geometry: Geometry | null = null;
         if (__geometry_json) {
             try {
-                geometry = JSON.parse(String(__geometry_json));
+                geometry = JSON.parse(String(__geometry_json)) as Geometry;
             } catch (err) {
                 console.warn('Failed to parse geometry:', err);
             }
@@ -234,6 +240,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             OGCAPIConformanceClass.COMMON_JSON,
             OGCAPIConformanceClass.FEATURES_CORE,
             OGCAPIConformanceClass.FEATURES_GEOJSON,
+            ...this.schemaConformanceClasses(),
         ];
     }
 
@@ -346,37 +353,187 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         return undefined;
     }
 
+    /**
+     * Builds a JSON Schema (Part 5) describing the table's columns, carrying
+     * every constraint DuckDB already knows about rather than just `{ type }`:
+     * `enum` for an `ENUM` column, `required` for non-nullable columns,
+     * `maxLength` where DuckDB reports a `character_maximum_length`,
+     * `x-ogc-role` on the discovered geometry column (and, where unambiguous,
+     * the id column) — matching what `InMemoryProvider.getSchema` already
+     * emits for `x-ogc-role: 'primary-geometry'` — plus two keywords QGIS's
+     * OGC API - Features provider actually parses: `x-ogc-propertySeq`
+     * (the column's `ordinal_position`, so QGIS orders attribute-table
+     * fields the way the table declares them) and `title` (a derived field
+     * alias — see `titleFromColumnName`).
+     *
+     * Deliberately not emitted: `description` and `readOnly`. DuckDB has no
+     * column-comment metadata readily available through
+     * `information_schema.columns` here, and no column in a plain DuckDB
+     * table is read-only, so there is nothing truthful to put in either
+     * keyword — inventing values would be fabrication, not metadata.
+     *
+     * This is advisory metadata for clients, not enforcement: the provider
+     * does not validate a request body against this schema before writing.
+     * Enforcement is left to the database, whose rejections the write paths
+     * below translate into `FeatureValidationError`.
+     */
     async getSchema(req: DuckDBRequest, collectionId: string): Promise<Record<string, unknown>> {
         const db = this.conn(req);
         const tableName = this.physicalTableName(req, collectionId);
 
         const columns = await db.runAndReadAll(`
-      SELECT column_name, data_type
+      SELECT column_name, data_type, is_nullable, character_maximum_length, ordinal_position
       FROM information_schema.columns
       WHERE table_schema = current_schema() AND table_name = ?
     `, [tableName]);
 
+        // Reuse the same discovery the read/write paths use, rather than
+        // assuming the column is literally named 'geometry' — the two bundled
+        // providers must agree on which column is "the" geometry column.
+        const geometryColumn = await this.geometryColumn(db, tableName);
+
+        // Mark an id column only when discovery is unambiguous: 'id' and 'fid'
+        // are both conventional identifier names, and `idColumns` can return
+        // both if a table happens to define both. When it does, there's no
+        // clean way to say which one *is* the identifier, so the role is
+        // omitted rather than guessed.
+        const idCols = await this.idColumns(db, tableName);
+        const idColumn = idCols.length === 1 ? idCols[0] : undefined;
+
         const properties: Record<string, any> = {};
+        const required: string[] = [];
 
         const cols = columns.getRowObjectsJS();
         for (const col of cols) {
-            properties[String(col['column_name'])] = {
-                type: this.mapDuckDBTypeToJSON(String(col['data_type'])),
-            };
+            const columnName = String(col['column_name']);
+            const dataType = String(col['data_type']);
+
+            const property: Record<string, unknown> = {};
+
+            property.title = this.titleFromColumnName(columnName);
+
+            const ordinalPosition = col['ordinal_position'];
+            if (ordinalPosition !== null && ordinalPosition !== undefined) {
+                property['x-ogc-propertySeq'] = Number(ordinalPosition);
+            }
+
+            const enumValues = this.parseEnumValues(dataType);
+            if (enumValues) {
+                property.type = 'string';
+                property.enum = enumValues;
+            } else {
+                property.type = this.mapDuckDBTypeToJSON(dataType);
+            }
+
+            const maxLength = col['character_maximum_length'];
+            if (maxLength !== null && maxLength !== undefined) {
+                const n = Number(maxLength);
+                if (Number.isFinite(n)) {
+                    property.maxLength = n;
+                }
+            }
+
+            if (geometryColumn && columnName === geometryColumn) {
+                property['x-ogc-role'] = 'primary-geometry';
+            } else if (idColumn && columnName === idColumn) {
+                property['x-ogc-role'] = 'id';
+            }
+
+            properties[columnName] = property;
+
+            if (String(col['is_nullable']).toUpperCase() === 'NO') {
+                required.push(columnName);
+            }
         }
 
         return {
+            $schema: 'https://json-schema.org/draft/2019-09/schema',
             type: 'object',
             properties,
+            required,
         };
+    }
+
+    /**
+     * Parse DuckDB's rendering of an ENUM column's `data_type` — e.g.
+     * `ENUM('asphalt', 'gravel', 'dirt')` — into its member values.
+     *
+     * DuckDB single-quotes each value and escapes an embedded quote by
+     * doubling it (`''`); a value can also contain a comma. A naive
+     * `split(',')` breaks on either, so this scans character-by-character
+     * instead. Returns `undefined` — never a wrong or partial list — for
+     * anything that doesn't parse cleanly as `ENUM(...)`, including a
+     * malformed or unrecognised rendering.
+     */
+    private parseEnumValues(dataType: string): string[] | undefined {
+        const match = /^ENUM\((.*)\)$/is.exec(dataType.trim());
+        if (!match) {
+            return undefined;
+        }
+        const body = match[1] ?? '';
+        const values: string[] = [];
+        let i = 0;
+        const len = body.length;
+
+        while (i < len) {
+            while (i < len && /\s/.test(body[i]!)) i++;
+            if (i >= len) break;
+            if (body[i] !== "'") {
+                return undefined; // expected a quoted value here
+            }
+            i++; // consume opening quote
+
+            let value = '';
+            let closed = false;
+            while (i < len) {
+                const ch = body[i];
+                if (ch === "'") {
+                    if (body[i + 1] === "'") {
+                        value += "'";
+                        i += 2;
+                        continue;
+                    }
+                    i++; // consume closing quote
+                    closed = true;
+                    break;
+                }
+                value += ch;
+                i++;
+            }
+            if (!closed) {
+                return undefined; // unterminated quoted value
+            }
+            values.push(value);
+
+            while (i < len && /\s/.test(body[i]!)) i++;
+            if (i >= len) break;
+            if (body[i] !== ',') {
+                return undefined; // unexpected content between values
+            }
+            i++; // consume comma
+        }
+
+        return values;
     }
 
     private mapDuckDBTypeToJSON(duckdbType: string): string {
         const type = duckdbType.toUpperCase();
-        if (type.includes('INT') || type.includes('BIGINT')) return 'integer';
+        // Spatial types are checked first: `POINT`, `POLYGON` and
+        // `LINESTRING` all contain the substring `INT`/`POLY`-adjacent
+        // characters that must not fall into the numeric branch below (a
+        // `POINT` column was previously reported as `integer`, since
+        // `'POINT'.includes('INT')` is true).
+        if (
+            type.includes('GEOMETRY') ||
+            type.includes('POINT') ||
+            type.includes('POLYGON') ||
+            type.includes('LINESTRING')
+        ) {
+            return 'object';
+        }
+        if (type.includes('INT')) return 'integer';
         if (type.includes('DOUBLE') || type.includes('FLOAT') || type.includes('DECIMAL')) return 'number';
         if (type.includes('BOOL')) return 'boolean';
-        if (type.includes('GEOMETRY')) return 'object';
         return 'string';
     }
 
@@ -510,7 +667,12 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
       RETURNING *
     `;
 
-        const reader = await db.runAndReadAll(query, values);
+        let reader;
+        try {
+            reader = await db.runAndReadAll(query, values);
+        } catch (err) {
+            throw this.translateWriteError(err, feature.properties ?? {});
+        }
         const row = reader.getRowObjectsJS()[0];
 
         if (row) {
@@ -558,7 +720,11 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
       WHERE ${this.idClause(idCols)}
     `;
 
-        await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
+        try {
+            await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
+        } catch (err) {
+            throw this.translateWriteError(err, feature.properties ?? {});
+        }
 
         return await this.getFeature(req, collectionId, featureId);
     }
@@ -590,7 +756,11 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
       WHERE ${this.idClause(idCols)}
     `;
 
-        await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
+        try {
+            await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
+        } catch (err) {
+            throw this.translateWriteError(err, updates);
+        }
 
         return await this.getFeature(req, collectionId, featureId);
     }
@@ -601,9 +771,144 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
         const idCols = await this.idColumns(db, tableName);
         const query = `DELETE FROM ${this.quote(tableName)} WHERE ${this.idClause(idCols)}`;
-        const result = await db.run(query, idCols.map(() => featureId));
+
+        let result;
+        try {
+            result = await db.run(query, idCols.map(() => featureId));
+        } catch (err) {
+            throw this.translateWriteError(err, {});
+        }
 
         return result.rowsChanged > 0;
+    }
+
+    /**
+     * Translate a DuckDB write-time rejection into a `FeatureValidationError`
+     * when the rejection is the *client's* fault, so `items-curd.ts` can
+     * respond 400/409 instead of 500 with the database's internal wording.
+     * Anything not recognised below is returned unchanged and still 500s —
+     * this is a denylist-style translation of *known* client-fault shapes,
+     * not an attempt to reclassify every possible DuckDB error.
+     *
+     * Classification (see the DuckDB error text this matches against):
+     * - `Conversion Error` (a value that won't coerce to the column's type,
+     *   e.g. an invalid enum member or a non-numeric string for a numeric
+     *   column) → 400.
+     * - `Constraint Error: NOT NULL constraint failed: ...` → 400, naming
+     *   the property.
+     * - `Constraint Error: CHECK constraint failed ...` → 400.
+     * - `Constraint Error: Duplicate key ... violates primary key/unique
+     *   constraint.` → 409 (a uniqueness conflict is a different feature
+     *   already occupying that value, which is what 409 Conflict means —
+     *   this applies to both primary-key and unique-constraint violations,
+     *   regardless of which write method triggered it, since the message
+     *   itself is what carries the meaning, not the call site).
+     * - `Binder Error` naming a column that doesn't exist (either shape
+     *   DuckDB uses: an `UPDATE ... SET` targeting an absent column, or an
+     *   `INSERT` naming one) → 400, since the column names came from the
+     *   client's request body. This is also what closes the "PUT to a
+     *   geometryless table" 500: with no geometry column, `replaceFeature`
+     *   emits `SET "geometry" = ...`, which DuckDB rejects with exactly this
+     *   Binder Error shape.
+     * - `Catalog Error` (missing table) and anything else are left alone —
+     *   callers already resolve unknown collections before most write calls,
+     *   and an unrecognised error shape should keep failing loudly as a 500
+     *   rather than being silently mis-classified.
+     */
+    private translateWriteError(err: unknown, properties: Record<string, unknown>): unknown {
+        if (!(err instanceof Error)) {
+            return err;
+        }
+        const message = err.message;
+
+        const conversionMatch = /^Conversion Error: Could not convert string '((?:[^']|'')*)' to \w+/.exec(message);
+        if (conversionMatch) {
+            const rawValue = conversionMatch[1]!.replace(/''/g, "'");
+            const property = this.findPropertyByValue(properties, rawValue);
+            return new FeatureValidationError(
+                property
+                    ? `Property "${property}" has a value that is not valid for its column.`
+                    : 'A property value in the request could not be converted to its column type.',
+                { property, status: 400, cause: err }
+            );
+        }
+        if (message.startsWith('Conversion Error:')) {
+            return new FeatureValidationError(
+                'A property value in the request could not be converted to its column type.',
+                { status: 400, cause: err }
+            );
+        }
+
+        const notNullPrefix = 'Constraint Error: NOT NULL constraint failed: ';
+        if (message.startsWith(notNullPrefix)) {
+            const qualified = message.slice(notNullPrefix.length).trim();
+            const property = qualified.includes('.') ? qualified.slice(qualified.lastIndexOf('.') + 1) : qualified;
+            return new FeatureValidationError(`Property "${property}" is required and cannot be null.`, {
+                property,
+                status: 400,
+                cause: err,
+            });
+        }
+
+        if (message.startsWith('Constraint Error: CHECK constraint failed')) {
+            return new FeatureValidationError('The submitted feature violates a constraint on this collection.', {
+                status: 400,
+                cause: err,
+            });
+        }
+
+        const duplicateKeyMatch = /^Constraint Error: Duplicate key "([^"]+)" violates (primary key|unique) constraint\.$/.exec(
+            message
+        );
+        if (duplicateKeyMatch) {
+            const keyText = duplicateKeyMatch[1]!;
+            // A composite key renders as `"a: 1, b: 2"` — only single-column
+            // keys are unambiguous to name a property for.
+            const separator = keyText.indexOf(': ');
+            const property =
+                !keyText.includes(', ') && separator !== -1 ? keyText.slice(0, separator) : undefined;
+            const value = property !== undefined ? keyText.slice(separator + 2) : undefined;
+            return new FeatureValidationError(
+                property
+                    ? `A feature with "${property}" = "${value}" already exists.`
+                    : 'A feature with a conflicting key already exists.',
+                { property, status: 409, cause: err }
+            );
+        }
+
+        const updateColumnMatch = /^Binder Error: Referenced update column (\S+) not found in table!/.exec(message);
+        if (updateColumnMatch) {
+            const property = updateColumnMatch[1]!;
+            return new FeatureValidationError(`Property "${property}" does not exist on this collection.`, {
+                property,
+                status: 400,
+                cause: err,
+            });
+        }
+
+        const insertColumnMatch = /^Binder Error: .*does not have a column with name "([^"]+)"/.exec(message);
+        if (insertColumnMatch) {
+            const property = insertColumnMatch[1]!;
+            return new FeatureValidationError(`Property "${property}" does not exist on this collection.`, {
+                property,
+                status: 400,
+                cause: err,
+            });
+        }
+
+        return err;
+    }
+
+    /**
+     * Best-effort match of a value called out in a DuckDB error message back
+     * to the property that submitted it. Only returns a name when exactly one
+     * submitted property carries that exact value — with zero or several
+     * candidates it's not safe to guess, so the caller gets a generic message
+     * instead of a wrong property name.
+     */
+    private findPropertyByValue(properties: Record<string, unknown>, rawValue: string): string | undefined {
+        const matches = Object.entries(properties).filter(([, value]) => String(value) === rawValue);
+        return matches.length === 1 ? matches[0]![0] : undefined;
     }
 
     addCollection(_collection: Collection): void {

@@ -1,5 +1,6 @@
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
+import { FeatureValidationError } from '@/errors';
 
 import type { FeatureCollection, Link, ProviderRequest, QueryParams } from '@/types';
 import type { NextFunction, Request, Response, Router } from 'express';
@@ -88,6 +89,22 @@ export class ItemsCURDHandler extends BaseHandler {
     }
 
     return params;
+  }
+
+  /**
+   * Shared catch handling for the write endpoints (Part 4). A
+   * `FeatureValidationError` means the database rejected the write for a
+   * reason that's the client's fault — respond with the status it carries
+   * (400, or 409 for a uniqueness conflict) via the existing `sendError`
+   * helper. Anything else is a genuine server fault and still goes to
+   * `next(err)`, same as before.
+   */
+  private handleWriteError(res: Response, next: NextFunction, err: unknown): void {
+    if (err instanceof FeatureValidationError) {
+      this.sendError(res, err.status, err.message);
+      return;
+    }
+    next(err);
   }
 
   private async handleFeatures(
@@ -231,7 +248,7 @@ export class ItemsCURDHandler extends BaseHandler {
         req as ProviderRequest,
         collectionId
       );
-      res.json(queryables);
+      res.type('application/schema+json').json(queryables);
     } catch (err) {
       next(err);
     }
@@ -273,7 +290,7 @@ export class ItemsCURDHandler extends BaseHandler {
         )
         .json(created);
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 
@@ -300,7 +317,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.status(204).send();
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 
@@ -327,7 +344,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.status(204).send();
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 
@@ -352,7 +369,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.status(204).send();
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 

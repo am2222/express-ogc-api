@@ -1,17 +1,32 @@
 import { OGCAPIConformanceClass } from './ogc-confirmance';
 import type { Request, Response } from 'express';
 import type { ParsedQs } from 'qs';
+import type {
+  Feature as GeoJSONFeature,
+  FeatureCollection as GeoJSONFeatureCollection,
+  Geometry,
+} from 'geojson';
+import type { JSONSchema7, JSONSchema7Definition } from 'json-schema';
 
-export interface Feature {
-  type: 'Feature';
+/**
+ * A GeoJSON feature as served by this API.
+ *
+ * Built on `@types/geojson` so `geometry` is a discriminated union rather than
+ * `any` — narrowing on `geometry.type` gives you typed `coordinates`. `null` is
+ * permitted for unlocated features (RFC 7946 §3.2) and is what Part 7's
+ * `skipGeometry` produces.
+ *
+ * Narrows GeoJSON's optional `id` to required: OGC API - Features addresses
+ * every item at `/items/{featureId}`, so a feature we serve always has one.
+ */
+export interface Feature
+  extends GeoJSONFeature<Geometry | null, Record<string, unknown>> {
   id: string | number;
-  geometry: any;
-  properties: Record<string, unknown>;
   links?: Link[];
 }
 
-export interface FeatureCollection {
-  type: 'FeatureCollection';
+export interface FeatureCollection
+  extends GeoJSONFeatureCollection<Geometry | null, Record<string, unknown>> {
   features: Feature[];
   links?: Link[];
   numberMatched?: number;
@@ -112,12 +127,17 @@ export interface UpdateFeatureParams {
   replace?: boolean;
 }
 
-export interface Queryable {
+/**
+ * The queryables schema for a collection (Part 3).
+ *
+ * Extends `JSONSchema7` so nested property schemas are typed instead of
+ * `unknown`; `$id`, `$schema`, `type` and `properties` are narrowed to required
+ * because OGC API - Features mandates all four on this resource.
+ */
+export interface Queryable extends JSONSchema7 {
   $id: string;
   type: 'object';
-  title?: string;
-  description?: string;
-  properties: Record<string, unknown>;
+  properties: Record<string, JSONSchema7Definition>;
   $schema: string;
 }
 

@@ -101,6 +101,9 @@ export type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 export { DuckDBProvider } from '@/providers/duck-db-provider';
 export type { DuckDBProviderDef, DuckDBLocals } from '@/providers/duck-db-provider';
 
+export { FeatureValidationError } from '@/errors';
+export type { FeatureValidationErrorStatus, FeatureValidationErrorOptions } from '@/errors';
+
 // CQL2 -> SQL translation. Usable standalone, with any provider.
 export { Cql2ToSql, duckdbPatches, SUPPORTED_OPS, Cql2Error } from '@/cql2';
 export type {

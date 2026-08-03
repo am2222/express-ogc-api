@@ -73,12 +73,22 @@ export class InMemoryProvider extends BaseProvider {
     const features = await this.getFeatures(req, collectionId, { limit: 1 });
     const sampleFeature = features.features[0];
 
-    // Build properties schema from sample feature
+    // Build properties schema from sample feature. `x-ogc-propertySeq` and
+    // `title` mirror what `DuckDBProvider.getSchema` emits: the geometry
+    // stub below is always sequence 0 (it's the primary geometry, declared
+    // first), and every inferred property gets the next sequence in the
+    // sample feature's own key order — that order is the closest thing an
+    // in-memory feature has to a "declared" column order — plus a title
+    // derived the same simple way (see `titleFromColumnName`).
     const propertiesSchema: Record<string, any> = {};
 
     if (sampleFeature?.properties) {
-      Object.entries(sampleFeature.properties).forEach(([key, value]) => {
-        propertiesSchema[key] = this.inferPropertyType(value);
+      Object.entries(sampleFeature.properties).forEach(([key, value], index) => {
+        propertiesSchema[key] = {
+          ...this.inferPropertyType(value),
+          title: this.titleFromColumnName(key),
+          'x-ogc-propertySeq': index + 1,
+        };
       });
     }
 
@@ -93,7 +103,8 @@ export class InMemoryProvider extends BaseProvider {
         geometry: {
           format: 'geometry-any',
           'x-ogc-role': 'primary-geometry',
-
+          title: 'Geometry',
+          'x-ogc-propertySeq': 0,
           description: 'The geometry of the feature',
         },
         ...propertiesSchema,
@@ -108,7 +119,8 @@ export class InMemoryProvider extends BaseProvider {
       OGCAPIConformanceClass.COMMON_JSON,
       OGCAPIConformanceClass.FEATURES_CORE,
       OGCAPIConformanceClass.FEATURES_GEOJSON,
-    ];  
+      ...this.schemaConformanceClasses(),
+    ];
   }
 
   addCollection(collection: Collection): void {

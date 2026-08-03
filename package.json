@@ -7,18 +7,29 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
     }
   },
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/am2222/express-ogc-api.git"
+  },
+  "homepage": "https://github.com/am2222/express-ogc-api#readme",
+  "bugs": {
+    "url": "https://github.com/am2222/express-ogc-api/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && tsc-alias --resolve-full-paths",
+    "typecheck": "tsc --noEmit",
     "example": "tsx examples/example-duckdb-provider.ts",
-    "test": "vitest",
+    "test": "vitest run",
     "test:debug": "vitest --inspect-brk",
     "test:ui": "vitest --ui",
     "test:watch": "vitest --watch",
@@ -37,14 +48,14 @@
   "author": "Majid Hojati",
   "license": "MIT",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "peerDependencies": {
     "express": "^4.18.0 || ^5.0.0"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
-    "@types/geojson": "^7946.0.16",
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^20.19.27",
     "@typescript-eslint/eslint-plugin": "^6.14.0",
     "@typescript-eslint/parser": "^6.14.0",
@@ -52,6 +63,7 @@
     "@vitest/ui": "^4.0.16",
     "eslint": "^8.55.0",
     "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.3",
     "prettier": "^3.1.1",
     "tsc-alias": "^1.8.16",
     "tsx": "^4.21.0",
@@ -61,11 +73,8 @@
   },
   "dependencies": {
     "@duckdb/node-api": "^1.4.3-r.1",
-    "cql2-wasm": "^0.5.6",
-    "duckdb-async": "^1.4.2",
-    "express": "^4.18.0 || ^5.0.0",
-    "express-jsdoc-swagger": "^1.8.0",
-    "swagger-jsdoc": "^6.2.8",
-    "swagger-ui-express": "^5.0.1"
+    "@types/geojson": "^7946.0.16",
+    "@types/json-schema": "^7.0.15",
+    "cql2-wasm": "^0.5.6"
   }
 }
