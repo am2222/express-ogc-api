@@ -139,7 +139,7 @@ export abstract class BaseProvider<
     req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string
-  ): Promise<Feature> | Feature | null;
+  ): Promise<Feature | null> | Feature | null;
 
   abstract getQueryables(
     req: ProviderRequest<TParams, TLocals>,

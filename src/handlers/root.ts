@@ -100,7 +100,7 @@ export class RootHandler extends BaseHandler {
     res.send();
   }
   
-  private generateOpenAPISpec(): any {
+  private generateOpenAPISpec(req: Request): any {
     return {
       openapi: '3.0.0',
       info: {
@@ -113,7 +113,7 @@ export class RootHandler extends BaseHandler {
       },
       servers: [
         {
-          url: this.basePath || '/',
+          url: this.resolvePrefix(req) || '/',
           description: 'OGC API - Features Server'
         }
       ],
@@ -403,11 +403,9 @@ export class RootHandler extends BaseHandler {
     // OPTIONS for root
     router.options('*', this.handleOptionsRequests.bind(this));
 
-    const swaggerSpec = this.generateOpenAPISpec();
-
-    // Serve OpenAPI JSON
-    router.get('/api', (_req, res) => {
-      res.json(swaggerSpec);
+    // Serve OpenAPI JSON, rebuilt per request so it reflects the mount path
+    router.get('/api', (req, res) => {
+      res.json(this.generateOpenAPISpec(req));
     });
   }
 }

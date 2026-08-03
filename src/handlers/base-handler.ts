@@ -8,7 +8,7 @@ import type { Exception, OGCFeaturesConfig } from '@/types';
 export class BaseHandler {
   provider: BaseProvider<any, any>;
   requiredCoreClasses: OGCAPIConformanceItem[] = [];
-  basePath: string = '/';
+  basePath?: string;
   options: OGCFeaturesConfig = {};
 
   constructor(provider: BaseProvider<any, any>, options: OGCFeaturesConfig = {}) {
@@ -49,6 +49,17 @@ export class BaseHandler {
     );
   }
 
+  /**
+   * The URL prefix for generated links: the configured `basePath` when set,
+   * otherwise the mount path Express resolved for this request. `req.baseUrl`
+   * already has route params substituted, so a router mounted at
+   * `/root/:dbid` yields `/root/db1`.
+   */
+  protected resolvePrefix(req: Request): string {
+    const prefix = this.basePath ?? req.baseUrl ?? '';
+    return prefix.replace(/\/+$/, '');
+  }
+
   buildUrl(
     req: Request,
     path: string,
@@ -57,7 +68,7 @@ export class BaseHandler {
   ): string {
     const protocol = req.protocol;
     const host = req.get('host');
-    const basePath = this.basePath.replace(/\/+$/, '');
+    const basePath = this.resolvePrefix(req);
     const baseUrl = `${protocol}://${host}${basePath}${path}`;
 
     // Determine which query parameters to use

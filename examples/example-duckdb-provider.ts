@@ -17,13 +17,15 @@ export async function initializeDuckDB(dbPath: string = ':memory:'): Promise<Duc
 }
 
 /**
- * Create a cities collection/table
+ * Create a cities collection/table for the given tenant prefix.
+ * Tenant `db1`'s cities live in table `db1_cities`.
  */
-export async function createCitiesCollection(db: DuckDBConnection): Promise<void> {
-
-
+export async function createCitiesCollection(
+    db: DuckDBConnection,
+    prefix: string
+): Promise<void> {
     await db.run(`
-    CREATE TABLE IF NOT EXISTS cities (
+    CREATE TABLE IF NOT EXISTS ${prefix}_cities (
       id INTEGER PRIMARY KEY,
       name VARCHAR,
       country VARCHAR,
@@ -35,15 +37,18 @@ export async function createCitiesCollection(db: DuckDBConnection): Promise<void
     );
   `);
 
-    console.log('✓ Created cities collection');
+    console.log(`✓ Created ${prefix}_cities`);
 }
 
 /**
- * Create a parks collection/table
+ * Create a parks collection/table for the given tenant prefix.
  */
-export async function createParksCollection(db: DuckDBConnection): Promise<void> {
+export async function createParksCollection(
+    db: DuckDBConnection,
+    prefix: string
+): Promise<void> {
     await db.run(`
-    CREATE TABLE IF NOT EXISTS parks (
+    CREATE TABLE IF NOT EXISTS ${prefix}_parks (
       id INTEGER PRIMARY KEY,
       name VARCHAR,
       park_type VARCHAR,
@@ -55,15 +60,18 @@ export async function createParksCollection(db: DuckDBConnection): Promise<void>
     );
   `);
 
-    console.log('✓ Created parks collection');
+    console.log(`✓ Created ${prefix}_parks`);
 }
 
 /**
- * Create a roads collection/table
+ * Create a roads collection/table for the given tenant prefix.
  */
-export async function createRoadsCollection(db: DuckDBConnection): Promise<void> {
+export async function createRoadsCollection(
+    db: DuckDBConnection,
+    prefix: string
+): Promise<void> {
     await db.run(`
-    CREATE TABLE IF NOT EXISTS roads (
+    CREATE TABLE IF NOT EXISTS ${prefix}_roads (
       id INTEGER PRIMARY KEY,
       name VARCHAR,
       road_type VARCHAR,
@@ -75,13 +83,13 @@ export async function createRoadsCollection(db: DuckDBConnection): Promise<void>
     );
   `);
 
-    console.log('✓ Created roads collection');
+    console.log(`✓ Created ${prefix}_roads`);
 }
 
 /**
- * Insert sample city features
+ * Insert sample city features into the given tenant's table.
  */
-export async function insertCityFeatures(db: DuckDBConnection): Promise<void> {
+export async function insertCityFeatures(db: DuckDBConnection, prefix: string): Promise<void> {
     const cities = [
         {
             id: 1,
@@ -142,7 +150,7 @@ export async function insertCityFeatures(db: DuckDBConnection): Promise<void> {
 
     for (const city of cities) {
         await db.run(`
-      INSERT INTO cities (id, name, country, population, area_km2, founded_year, is_capital, geometry)
+      INSERT INTO ${prefix}_cities (id, name, country, population, area_km2, founded_year, is_capital, geometry)
       VALUES (?, ?, ?, ?, ?, ?, ?, ST_Point(?, ?))
     `, [
             city.id,
@@ -157,13 +165,13 @@ export async function insertCityFeatures(db: DuckDBConnection): Promise<void> {
         ]);
     }
 
-    console.log(`✓ Inserted ${cities.length} city features`);
+    console.log(`✓ Inserted ${cities.length} city features into ${prefix}_cities`);
 }
 
 /**
- * Insert sample park features
+ * Insert sample park features into the given tenant's table.
  */
-export async function insertParkFeatures(db: DuckDBConnection): Promise<void> {
+export async function insertParkFeatures(db: DuckDBConnection, prefix: string): Promise<void> {
     const parks = [
         {
             id: 1,
@@ -219,7 +227,7 @@ export async function insertParkFeatures(db: DuckDBConnection): Promise<void> {
     for (const park of parks) {
         const coordString = park.coords.map(c => `${c[0]} ${c[1]}`).join(', ');
         await db.run(`
-      INSERT INTO parks (id, name, park_type, area_hectares, established_date, visitor_count, has_camping, geometry)
+      INSERT INTO ${prefix}_parks (id, name, park_type, area_hectares, established_date, visitor_count, has_camping, geometry)
       VALUES (?, ?, ?, ?, ?, ?, ?, ST_GeomFromText('POLYGON((${coordString}))'))
     `, [
             park.id,
@@ -232,13 +240,13 @@ export async function insertParkFeatures(db: DuckDBConnection): Promise<void> {
         ]);
     }
 
-    console.log(`✓ Inserted ${parks.length} park features`);
+    console.log(`✓ Inserted ${parks.length} park features into ${prefix}_parks`);
 }
 
 /**
- * Insert sample road features
+ * Insert sample road features into the given tenant's table.
  */
-export async function insertRoadFeatures(db: DuckDBConnection): Promise<void> {
+export async function insertRoadFeatures(db: DuckDBConnection, prefix: string): Promise<void> {
     const roads = [
         {
             id: 1,
@@ -303,7 +311,7 @@ export async function insertRoadFeatures(db: DuckDBConnection): Promise<void> {
     for (const road of roads) {
         const coordString = road.coords.map(c => `${c[0]} ${c[1]}`).join(', ');
         await db.run(`
-      INSERT INTO roads (id, name, road_type, length_km, lanes, surface, max_speed, geometry)
+      INSERT INTO ${prefix}_roads (id, name, road_type, length_km, lanes, surface, max_speed, geometry)
       VALUES (?, ?, ?, ?, ?, ?, ?, ST_GeomFromText('LINESTRING(${coordString})'))
     `, [
             road.id,
@@ -316,66 +324,82 @@ export async function insertRoadFeatures(db: DuckDBConnection): Promise<void> {
         ]);
     }
 
-    console.log(`✓ Inserted ${roads.length} road features`);
+    console.log(`✓ Inserted ${roads.length} road features into ${prefix}_roads`);
 }
 
 /**
- * Setup complete database with all collections and features
+ * Set up a single in-memory database seeded for two tenants, `db1` and
+ * `db2`. Tenants are table-name prefixes, not separate databases: tenant
+ * `db1`'s cities live in table `db1_cities`. The application owns connection
+ * setup (including loading the `spatial` extension) and hands a live
+ * `DuckDBConnection` — not a `DuckDBInstance` — to the request middleware
+ * below, because the provider no longer owns a database of its own.
  */
-export async function setupCompleteDatabase(dbPath: string = ':memory:'): Promise<DuckDBInstance> {
+export async function setupDatabase(): Promise<DuckDBConnection> {
     console.log('🚀 Initializing DuckDB database...\n');
 
-    const db = await initializeDuckDB(dbPath);
-    const connection = await db.connect();
+    const instance = await DuckDBInstance.create(':memory:');
+    const connection = await instance.connect();
+    await connection.run('INSTALL spatial; LOAD spatial;');
 
+    for (const prefix of ['db1', 'db2']) {
+        console.log(`📦 Creating collections for tenant "${prefix}"...`);
+        await createCitiesCollection(connection, prefix);
+        await createParksCollection(connection, prefix);
+        await createRoadsCollection(connection, prefix);
 
-    await connection.run("INSTALL spatial; LOAD spatial;");
-
-    console.log('📦 Creating collections...');
-    await createCitiesCollection(connection);
-    await createParksCollection(connection);
-    await createRoadsCollection(connection);
-
-    console.log('\n📝 Inserting features...');
-    await insertCityFeatures(connection);
-    await insertParkFeatures(connection);
-    await insertRoadFeatures(connection);
+        console.log(`📝 Inserting features for tenant "${prefix}"...`);
+        await insertCityFeatures(connection, prefix);
+        await insertParkFeatures(connection, prefix);
+        await insertRoadFeatures(connection, prefix);
+    }
 
     console.log('\n✅ Database setup complete!');
-    console.log('📊 Summary:');
 
-    const citiesCount = await connection.run('SELECT COUNT(*) as count FROM cities');
-    const parksCount = await connection.run('SELECT COUNT(*) as count FROM parks');
-    const roadsCount = await connection.run('SELECT COUNT(*) as count FROM roads');
-
-    console.log(`   - Cities: ${citiesCount.rowCount}`);
-    console.log(`   - Parks: ${parksCount.rowCount}`);
-    console.log(`   - Roads: ${roadsCount.rowCount}`);
-
-    return db;
+    return connection;
 }
 
-
-const db = await setupCompleteDatabase().catch(console.error);
+const db = await setupDatabase();
 
 const app = express();
 const port = process.env.PORT || 3001;
 
-// Create an in-memory provider
-const duck = new DuckDBProvider({database:db});
-await duck.initialize()
+// The set of tenants this deployment knows about. In a real app this might
+// come from a config store or a lookup against another database.
+const KNOWN_TENANTS = new Set(['db1', 'db2']);
 
-// Create OGC API instance
+// The provider is constructed with nothing but a name — it holds no
+// database, and there is no `initialize()` to call anymore.
+const duck = new DuckDBProvider({ name: 'DuckDBProvider' });
+
+// Create OGC API instance. `basePath` is omitted: generated links follow
+// the mount path (`req.baseUrl`), which is what makes a parametrized mount
+// like `/root/:dbid` work without hardcoding a tenant into the config.
 const ogcAPI = new OGCAPI(duck, app, {
-    basePath: '/ogc',
     title: 'World Cities OGC API',
-    description: 'Example OGC API Features server with in-memory provider',
+    description: 'Example OGC API Features server, one table prefix per tenant',
 });
 
-// Mount the OGC API router
-app.use('/ogc', ogcAPI.getRouter());
-app.use('/', (req, res) => {
-    res.send('Welcome to the OGC API Features Example Server! Visit /ogc for the API endpoints.');
+// Plain Express middleware — this is what replaced the old provider hooks.
+// It validates the tenant and puts the connection and the key where the
+// provider looks for them. The provider never learns your URL structure.
+app.use('/root/:dbid', (req, res, next) => {
+    if (!KNOWN_TENANTS.has(req.params.dbid)) {
+        res.status(404).json({ code: '404', description: `Unknown database ${req.params.dbid}` });
+        return;
+    }
+    res.locals.db = db;
+    res.locals.key = req.params.dbid;
+    next();
+});
+
+// Mount the OGC API router under the parametrized tenant path. Collection
+// ids stay unprefixed — `/root/db1/collections/cities` reads the
+// `db1_cities` table, so the prefix never appears in a URL.
+app.use('/root/:dbid', ogcAPI.getRouter());
+
+app.use('/', (_req, res) => {
+    res.send('OGC API Features example. Try /root/db1 or /root/db2.');
 });
 
 // Start the server
@@ -384,29 +408,25 @@ const server = app.listen(port, () => {
     console.log('================================');
     console.log(`Server running at http://localhost:${port}`);
     console.log('');
-    console.log('Available endpoints:');
-    console.log(`  Landing Page:  http://localhost:${port}/ogc`);
-    console.log(`  Conformance:   http://localhost:${port}/ogc/conformance`);
-    console.log(`  Collections:   http://localhost:${port}/ogc/collections`);
-    console.log(`  Cities:        http://localhost:${port}/ogc/collections/cities`);
-    console.log(`  Features:      http://localhost:${port}/ogc/collections/cities/items`);
+    console.log('Available endpoints (tenant db1, same shape for db2):');
+    console.log(`  Landing Page:  http://localhost:${port}/root/db1`);
+    console.log(`  Conformance:   http://localhost:${port}/root/db1/conformance`);
+    console.log(`  Collections:   http://localhost:${port}/root/db1/collections`);
+    console.log(`  Cities:        http://localhost:${port}/root/db1/collections/cities`);
+    console.log(`  Features:      http://localhost:${port}/root/db1/collections/cities/items`);
     console.log('');
     console.log('Press Ctrl+C to stop the server');
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('\n🛑 SIGTERM signal received: closing HTTP server');
+// Graceful shutdown — disconnect the single shared connection.
+function shutdown(signal: string) {
+    console.log(`\n🛑 ${signal} received: closing HTTP server`);
     server.close(() => {
+        db.disconnectSync();
         console.log('✅ HTTP server closed');
         process.exit(0);
     });
-});
+}
 
-process.on('SIGINT', () => {
-    console.log('\n🛑 SIGINT signal received: closing HTTP server');
-    server.close(() => {
-        console.log('✅ HTTP server closed');
-        process.exit(0);
-    });
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));

@@ -16,7 +16,6 @@ export class OGCAPI {
   app: Application;
 
   constructor(provider: BaseProvider<any, any>, app: Application, options: OGCFeaturesConfig = {}) {
-    this.router = Router();
     this.provider = provider;
     this.options = options;
     this.app = app;
@@ -25,7 +24,7 @@ export class OGCAPI {
       throw new Error('Provider is required to initialize OGCAPI');
     }
 
-    this.router = Router();
+    this.router = Router({ mergeParams: true });
     this.setup();
   }
 
@@ -99,4 +98,14 @@ export { BaseProvider } from '@/providers/base-provider';
 export type { OGCFeaturesConfig, Feature, ProviderRequest } from '@/types';
 export { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 export { DuckDBProvider } from '@/providers/duck-db-provider';
-export type { DuckDBProviderDef } from '@/providers/duck-db-provider';
+export type { DuckDBProviderDef, DuckDBLocals } from '@/providers/duck-db-provider';
+
+// CQL2 -> SQL translation. Usable standalone, with any provider.
+export { Cql2ToSql, duckdbPatches, SUPPORTED_OPS, Cql2Error } from '@/cql2';
+export type {
+  Cql2ToSqlOptions,
+  Cql2ErrorCode,
+  FilterLang,
+  Sql,
+  SqlPatch,
+} from '@/cql2';
