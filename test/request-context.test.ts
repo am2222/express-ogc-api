@@ -4,6 +4,24 @@ import type { AddressInfo } from 'node:net';
 import { OGCAPI } from '../src/index.js';
 import { RecordingProvider } from './helpers/recording-provider.js';
 
+interface LinkLike {
+  rel: string;
+  href: string;
+}
+
+interface CollectionsResponseBody {
+  links: LinkLike[];
+  collections: { links: LinkLike[] }[];
+}
+
+interface ItemsResponseBody {
+  links: LinkLike[];
+}
+
+interface OpenAPIResponseBody {
+  servers: { url: string }[];
+}
+
 function seed(provider: RecordingProvider): void {
   provider.addCollection({
     id: 'cities',
@@ -96,33 +114,29 @@ describe('request reaches the provider', () => {
 
   it('builds collection links from the resolved mount path', async () => {
     const res = await fetch(`${baseUrl}/root/db1/collections`);
-    const body = await res.json();
+    const body = (await res.json()) as CollectionsResponseBody;
 
-    const self = body.links.find((l: { rel: string }) => l.rel === 'self');
-    expect(self.href).toContain('/root/db1/collections');
-    expect(self.href).not.toContain(':dbid');
+    const self = body.links.find((l) => l.rel === 'self');
+    expect(self?.href).toContain('/root/db1/collections');
+    expect(self?.href).not.toContain(':dbid');
 
-    const items = body.collections[0].links.find(
-      (l: { rel: string }) => l.rel === 'items'
-    );
-    expect(items.href).toContain('/root/db1/collections/cities/items');
+    const items = body.collections[0]?.links.find((l) => l.rel === 'items');
+    expect(items?.href).toContain('/root/db1/collections/cities/items');
   });
 
   it('builds pagination links from the resolved mount path', async () => {
     const res = await fetch(`${baseUrl}/root/db1/collections/cities/items?limit=1&offset=1`);
-    const body = await res.json();
+    const body = (await res.json()) as ItemsResponseBody;
 
-    const rels = Object.fromEntries(
-      body.links.map((l: { rel: string; href: string }) => [l.rel, l.href])
-    );
+    const rels = Object.fromEntries(body.links.map((l) => [l.rel, l.href]));
     expect(rels.next).toContain('/root/db1/collections/cities/items');
     expect(rels.prev).toContain('/root/db1/collections/cities/items');
     expect(rels.next).not.toContain(':dbid');
   });
 
   it('serves an OpenAPI document scoped to the tenant', async () => {
-    const one = await (await fetch(`${baseUrl}/root/db1/api`)).json();
-    const two = await (await fetch(`${baseUrl}/root/db2/api`)).json();
+    const one = (await (await fetch(`${baseUrl}/root/db1/api`)).json()) as OpenAPIResponseBody;
+    const two = (await (await fetch(`${baseUrl}/root/db2/api`)).json()) as OpenAPIResponseBody;
 
     expect(one.servers[0].url).toBe('/root/db1');
     expect(two.servers[0].url).toBe('/root/db2');
@@ -149,11 +163,11 @@ describe('basePath override', () => {
 
   it('prefers the configured basePath over the mount path', async () => {
     const res = await fetch(`${baseUrl}/internal/collections`);
-    const body = await res.json();
+    const body = (await res.json()) as CollectionsResponseBody;
 
-    const self = body.links.find((l: { rel: string }) => l.rel === 'self');
-    expect(self.href).toContain('/public/ogc/collections');
-    expect(self.href).not.toContain('/internal');
+    const self = body.links.find((l) => l.rel === 'self');
+    expect(self?.href).toContain('/public/ogc/collections');
+    expect(self?.href).not.toContain('/internal');
   });
 });
 

@@ -57,9 +57,30 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         return db;
     }
 
-    /** The tenant key for this request, if middleware set one. */
+    /**
+     * The tenant key for this request, if middleware set one.
+     *
+     * Absent `key` (middleware never set the property at all) means "flat,
+     * single-tenant database" — a supported mode. But if `res.locals` *has* a
+     * `key` property, its value must be a non-empty string of `[A-Za-z0-9]`
+     * only: empty string must not silently mean "no tenant" (that would make
+     * discovery list the whole catalog and every table reference go
+     * unprefixed), and `_` must not be allowed in the key (it's the
+     * `<key>_<collection>` separator — allowing it would let one tenant's key
+     * be a prefix of another's, e.g. `acme` reading into `acme_eu`'s tables).
+     */
     private tenantKey(req: DuckDBRequest): string | undefined {
-        return req.res?.locals?.key;
+        const locals = req.res?.locals;
+        if (!locals || !('key' in locals)) {
+            return undefined;
+        }
+        const key = locals.key;
+        if (typeof key !== 'string' || key.length === 0 || !/^[A-Za-z0-9]+$/.test(key)) {
+            throw new Error(
+                `Invalid res.locals.key: ${JSON.stringify(key)} — tenant key must be a non-empty string containing only letters and digits (no underscores, which are reserved as the tenant/collection separator)`
+            );
+        }
+        return key;
     }
 
     /**
@@ -161,6 +182,23 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
+     * `reader.getRowObjectsJS()` returns DuckDB `BIGINT`/`UBIGINT`/`HUGEINT`
+     * columns as JS `bigint`, which `JSON.stringify` (used by `res.json()`)
+     * cannot serialize at all — it throws. Normalise: within the safe integer
+     * range, a plain `number` round-trips exactly; outside it, a decimal
+     * string is lossy but at least doesn't crash the response. Every other
+     * value passes through unchanged.
+     */
+    private normalizeValue(value: unknown): unknown {
+        if (typeof value !== 'bigint') {
+            return value;
+        }
+        return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(value)
+            : value.toString();
+    }
+
+    /**
      * Build a `Feature` from a raw row. Strips the internal `__geometry_json`
      * projection column and the raw geometry column itself out of `properties`
      * — without the latter, DuckDB's raw WKB `Uint8Array`/`Buffer` for the
@@ -169,7 +207,10 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      */
     private rowToFeature(row: Record<string, JS>, geometryColumn: string | undefined): Feature {
         const { __geometry_json, ...rest } = row;
-        const properties: Record<string, unknown> = rest;
+        const properties: Record<string, unknown> = {};
+        for (const [column, value] of Object.entries(rest)) {
+            properties[column] = this.normalizeValue(value);
+        }
         if (geometryColumn) {
             delete properties[geometryColumn];
         }
@@ -183,6 +224,10 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             }
         }
 
+        // No longer an inaccurate cast: `properties.id`/`properties.fid` have
+        // already had any bigint normalised to number/string above, so the
+        // runtime value genuinely matches `string | number` for conventional
+        // id columns.
         return {
             type: 'Feature',
             id: (properties.id ?? properties.fid) as string | number,
@@ -506,15 +551,25 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
         const columns = Object.keys(feature.properties || {});
         const values = Object.values(feature.properties || {}) as DuckDBValue[];
+        const setParts = columns.map((col) => `${this.quote(col)} = ?`);
 
-        if (columns.length === 0) {
+        if (feature.geometry) {
+            // Same handling as createFeature: target the geometry column the
+            // table actually has, not a hardcoded name, so a submitted
+            // geometry is never silently dropped from a PUT.
+            const geometryColumn = (await this.geometryColumn(db, tableName)) ?? 'geometry';
+            setParts.push(`${this.quote(geometryColumn)} = ST_GeomFromGeoJSON(?)`);
+            values.push(JSON.stringify(feature.geometry));
+        }
+
+        if (setParts.length === 0) {
             // Nothing to set — SET with no assignments is invalid SQL. Leave the
             // row as-is and hand back its current state.
             return await this.getFeature(req, collectionId, featureId);
         }
 
         const idCols = await this.idColumns(db, tableName);
-        const setClause = columns.map(col => `${this.quote(col)} = ?`).join(', ');
+        const setClause = setParts.join(', ');
 
         const query = `
       UPDATE ${this.quote(tableName)}

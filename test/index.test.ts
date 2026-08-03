@@ -138,4 +138,10 @@ describe('OGC API LandingPage', () => {
       response.headers.get('Allow')
     ).toBe('GET, HEAD, OPTIONS, POST, PUT, PATCH, DELETE');
   });
+
+  it('should return 404, not 500, for a nonexistent feature (F3)', async () => {
+    const response = await fetch(`${baseUrl}/ogc/collections/cities/items/does-not-exist`);
+
+    expect(response.status).toBe(404);
+  });
 });

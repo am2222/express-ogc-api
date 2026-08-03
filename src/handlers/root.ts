@@ -401,7 +401,10 @@ export class RootHandler extends BaseHandler {
     // Conformance
     router.get('/conformance', this.handleConformance.bind(this));
     // OPTIONS for root
-    router.options('*', this.handleOptionsRequests.bind(this));
+    // A bare '*' string is rejected by path-to-regexp v8 (Express 5) at route
+    // registration time — i.e. inside the OGCAPI constructor. A RegExp is
+    // accepted by both path-to-regexp v6 (Express 4) and v8 (Express 5).
+    router.options(/.*/, this.handleOptionsRequests.bind(this));
 
     // Serve OpenAPI JSON, rebuilt per request so it reflects the mount path
     router.get('/api', (req, res) => {

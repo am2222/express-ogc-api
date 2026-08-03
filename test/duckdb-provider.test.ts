@@ -177,6 +177,31 @@ describe('DuckDBProvider', () => {
     expect(await provider.deleteFeature(fakeReq(db), 'cities', '999')).toBe(false);
   });
 
+  it('replaceFeature stores a submitted geometry instead of silently dropping it', async () => {
+    const created = await provider.createFeature(fakeReq(db), 'cities', {
+      type: 'Feature',
+      id: 6,
+      geometry: { type: 'Point', coordinates: [10.0, 20.0] },
+      properties: { id: 6, name: 'Geoville', population: 1 },
+    });
+    expect(created?.geometry).toEqual({ type: 'Point', coordinates: [10, 20] });
+
+    const replaced = await provider.replaceFeature(fakeReq(db), 'cities', '6', {
+      type: 'Feature',
+      id: 6,
+      geometry: { type: 'Point', coordinates: [30.0, 40.0] },
+      properties: { name: 'Geoville', population: 1 },
+    });
+    expect(replaced?.geometry).toEqual({ type: 'Point', coordinates: [30, 40] });
+
+    // Re-read independently to confirm the new geometry was actually persisted,
+    // not just echoed back from the in-memory `feature` argument.
+    const reread = await provider.getFeature(fakeReq(db), 'cities', '6');
+    expect(reread?.geometry).toEqual({ type: 'Point', coordinates: [30, 40] });
+
+    expect(await provider.deleteFeature(fakeReq(db), 'cities', '6')).toBe(true);
+  });
+
   it('leaves the row untouched when updateFeature/replaceFeature get empty properties', async () => {
     const before = await provider.getFeature(fakeReq(db), 'cities', '1');
 
@@ -272,5 +297,70 @@ describe('DuckDBProvider', () => {
     >;
 
     await expect(provider.getCollections(noRes)).rejects.toThrow(/res\.locals\.db/);
+  });
+
+  it('normalizes BIGINT columns so the feature round-trips and JSON.stringify does not throw (F1)', async () => {
+    await db.run(`
+      CREATE TABLE big_numbers (
+        id BIGINT PRIMARY KEY,
+        big_value BIGINT
+      );
+    `);
+    // Comfortably above Number.MAX_SAFE_INTEGER (9007199254740991).
+    const huge = 9223372036854775000n;
+    await db.run(`INSERT INTO big_numbers VALUES (1, ${huge.toString()});`);
+
+    const fc = await provider.getFeatures(fakeReq(db), 'big_numbers', { limit: 10 });
+    const feature = fc.features[0];
+    expect(feature).toBeDefined();
+    expect(typeof feature?.id).not.toBe('bigint');
+    expect(feature?.id).toBe(1);
+    expect(typeof feature?.properties.big_value).not.toBe('bigint');
+    // Outside the safe integer range: a decimal string, not a silently truncated number.
+    expect(feature?.properties.big_value).toBe(huge.toString());
+    expect(() => JSON.stringify(fc)).not.toThrow();
+
+    const single = await provider.getFeature(fakeReq(db), 'big_numbers', '1');
+    expect(typeof single?.properties.big_value).not.toBe('bigint');
+    expect(single?.properties.big_value).toBe(huge.toString());
+    expect(() => JSON.stringify(single)).not.toThrow();
+  });
+
+  it('throws when res.locals.key is an empty string, instead of failing open to full-catalog access (F2)', async () => {
+    const req = {
+      params: {},
+      query: {},
+      baseUrl: '',
+      res: { locals: { db, key: '' } },
+    } as unknown as ProviderRequest<Record<string, string>, DuckDBLocals>;
+
+    await expect(provider.getCollections(req)).rejects.toThrow(/res\.locals\.key/);
+  });
+
+  it('throws when res.locals.key contains an underscore (F2)', async () => {
+    const req = {
+      params: {},
+      query: {},
+      baseUrl: '',
+      res: { locals: { db, key: 'acme_eu' } },
+    } as unknown as ProviderRequest<Record<string, string>, DuckDBLocals>;
+
+    await expect(provider.getCollections(req)).rejects.toThrow(/res\.locals\.key/);
+  });
+
+  it('throws when res.locals.key contains other punctuation (F2)', async () => {
+    const req = {
+      params: {},
+      query: {},
+      baseUrl: '',
+      res: { locals: { db, key: 'ac-me' } },
+    } as unknown as ProviderRequest<Record<string, string>, DuckDBLocals>;
+
+    await expect(provider.getCollections(req)).rejects.toThrow(/res\.locals\.key/);
+  });
+
+  it('treats an absent key as flat, single-tenant mode — still works, not an error (F2)', async () => {
+    const collections = await provider.getCollections(fakeReq(db));
+    expect(collections.map((c) => c.id)).toContain('cities');
   });
 });

@@ -49,11 +49,11 @@ export class RecordingProvider extends InMemoryProvider {
     return super.getFeatures(req, collectionId, params);
   }
 
-  override getFeature(
+  override async getFeature(
     req: ProviderRequest,
     collectionId: string,
     featureId: string
-  ): Feature | Promise<Feature> | null {
+  ): Promise<Feature | null> {
     this.record('getFeature', req);
     return super.getFeature(req, collectionId, featureId);
   }

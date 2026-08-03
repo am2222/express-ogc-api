@@ -60,8 +60,7 @@ provider.addFeature('cities', {
 });
 
 // Create OGC API instance
-const ogcAPI = new OGCAPI(provider, {
-  basePath: '/ogc',
+const ogcAPI = new OGCAPI(provider, app, {
   title: 'My Geospatial API',
   description: 'OGC API Features implementation'
 });
@@ -108,11 +107,12 @@ The middleware automatically creates the following OGC API endpoints:
 ### OGCAPI Constructor
 
 ```typescript
-new OGCAPI(provider: BaseProvider, options?: OGCFeaturesConfig)
+new OGCAPI(provider: BaseProvider<any, any>, app: Application, options?: OGCFeaturesConfig)
 ```
 
 **Parameters:**
 - \`provider\` - An instance of \`BaseProvider\` or its subclass (e.g., \`InMemoryProvider\`)
+- \`app\` - The Express application; used to detect an existing JSON body parser before mounting its own
 - \`options\` - Optional configuration object
 
 ### Configuration Options
@@ -185,10 +185,10 @@ whatever your own middleware attaches to \`req.res.locals\`:
 
 ```typescript
 import { BaseProvider, OGCAPIConformanceClass } from 'express-ogc-api';
-import type { ProviderRequest } from 'express-ogc-api';
+import type { ProviderRequest, QueryParams } from 'express-ogc-api';
 
-interface MyParams { dbid: string }
-interface MyLocals { tenant: { id: string } }
+type MyParams = { dbid: string };
+type MyLocals = { tenant: { id: string } };
 
 class MyCustomProvider extends BaseProvider<MyParams, MyLocals> {
   constructor() {
@@ -212,7 +212,7 @@ class MyCustomProvider extends BaseProvider<MyParams, MyLocals> {
   async getFeatures(
     req: ProviderRequest<MyParams, MyLocals>,
     collectionId: string,
-    params
+    params: QueryParams
   ) {
     // ...
   }
@@ -358,7 +358,8 @@ import {
   OGCAPIConformanceClass,
   Feature,
   FeatureCollection,
-  Collection
+  Collection,
+  QueryParams
 } from 'express-ogc-api';
 ```
 

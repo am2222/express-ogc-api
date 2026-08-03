@@ -1,4 +1,6 @@
 import { OGCAPIConformanceClass } from './ogc-confirmance';
+import type { Request, Response } from 'express';
+import type { ParsedQs } from 'qs';
 
 export interface Feature {
   type: 'Feature';
@@ -159,9 +161,6 @@ export interface LandingPage {
   description?: string;
   links: Link[];
 }
-
-import type { Request, Response } from 'express';
-import type { ParsedQs } from 'qs';
 
 /**
  * The Express request as seen by a provider.

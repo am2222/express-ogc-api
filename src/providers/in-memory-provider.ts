@@ -203,16 +203,13 @@ export class InMemoryProvider extends BaseProvider {
     };
   }
 
-  getFeature(
+  async getFeature(
     _req: ProviderRequest,
     collectionId: string,
     featureId: string
-  ): Feature | Promise<Feature> | null {
+  ): Promise<Feature | null> {
     const collectionFeatures = this.features.get(collectionId);
-    const feature = collectionFeatures?.get(featureId) || null;
-    return feature
-      ? Promise.resolve(feature)
-      : Promise.reject(new Error('Feature not found'));
+    return collectionFeatures?.get(featureId) ?? null;
   }
 
   // Part 3: Filtering support

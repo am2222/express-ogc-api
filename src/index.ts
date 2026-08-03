@@ -95,8 +95,9 @@ export class OGCAPI {
 export default OGCAPI;
 export { InMemoryProvider } from '@/providers/in-memory-provider';
 export { BaseProvider } from '@/providers/base-provider';
-export type { OGCFeaturesConfig, Feature, ProviderRequest } from '@/types';
+export type { OGCFeaturesConfig, Feature, ProviderRequest, QueryParams, Collection, FeatureCollection, Queryable, UpdateFeatureParams } from '@/types';
 export { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
+export type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 export { DuckDBProvider } from '@/providers/duck-db-provider';
 export type { DuckDBProviderDef, DuckDBLocals } from '@/providers/duck-db-provider';
 
