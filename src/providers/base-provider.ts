@@ -3,18 +3,21 @@ import type {
   Collection,
   Feature,
   FeatureCollection,
+  ProviderRequest,
   Queryable,
   QueryParams,
   UpdateFeatureParams,
 } from '@/types';
 import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
-import type { NextFunction, Router, Request, Response } from 'express';
 
 export interface ProviderDef {
   name: string;
 }
 
-export abstract class BaseProvider {
+export abstract class BaseProvider<
+  TParams extends Record<string, string> = Record<string, string>,
+  TLocals extends Record<string, any> = Record<string, any>,
+> {
   public name: string;
 
   public readonly enableSchemas: boolean = false;
@@ -85,72 +88,67 @@ export abstract class BaseProvider {
   }
 
   abstract getSchema(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string
   ): Promise<Record<string, unknown>> | Record<string, unknown>;
 
   abstract createFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     feature: Feature
   ): Promise<Feature | null>;
+
   abstract replaceFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string,
     feature: Feature
   ): Promise<Feature | null>;
+
   abstract updateFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string,
     params: UpdateFeatureParams
   ): Promise<Feature | null>;
+
   abstract deleteFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string
   ): Promise<boolean>;
 
   abstract conformanceClasses(): OGCAPIConformanceItem[];
 
-  abstract getCollections(): Promise<Collection[]> | Collection[];
+  abstract getCollections(
+    req: ProviderRequest<TParams, TLocals>
+  ): Promise<Collection[]> | Collection[];
+
   abstract getCollection(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string
   ): Promise<Collection | null> | Collection | null;
 
   abstract getFeatures(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     params: QueryParams
   ): Promise<FeatureCollection> | FeatureCollection;
+
   abstract getFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string
   ): Promise<Feature> | Feature | null;
-  abstract getQueryables(_collectionId: string): Promise<Queryable> | Queryable;
+
+  abstract getQueryables(
+    req: ProviderRequest<TParams, TLocals>,
+    collectionId: string
+  ): Promise<Queryable> | Queryable;
 
   // Abstract methods for collection management
   abstract addCollection(collection: Collection): void;
   abstract addFeature(collectionId: string, feature: Feature): void;
-
-  preProviderHook(_req: Request, _res: Response): void {
-    console.log('Pre-provider hook executed');
-    return;
-  }
-
-  postProviderHook(_req: Request, _res: Response): void {
-    console.log('Post-provider hook executed');
-    return;
-  }
-
-  setupProviderHooks(router: Router): void {
-    router.use((req: Request, res: Response, next: NextFunction) => {
-      this.preProviderHook(req, res);
-      next();
-    });
-
-    router.use((req: Request, res: Response, next: NextFunction) => {
-      res.on('finish', () => {
-        this.postProviderHook(req, res);
-      });
-      next();
-    });
-  }
 
 }
 

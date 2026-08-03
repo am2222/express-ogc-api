@@ -1,4 +1,5 @@
 import { BaseHandler } from '@/handlers/base-handler';
+import type { ProviderRequest } from '@/types';
 import type { NextFunction, Request, Response, Router } from 'express';
 
 export class RootHandler extends BaseHandler {
@@ -11,7 +12,7 @@ export class RootHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId } = req.params;
-      const schema = await this.provider.getSchema(collectionId);
+      const schema = await this.provider.getSchema(req as ProviderRequest, collectionId);
       res.json(schema);
     } catch (err) {
       next(err);

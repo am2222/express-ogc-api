@@ -5,6 +5,7 @@ import type {
     Collection,
     Feature,
     FeatureCollection,
+    ProviderRequest,
     Queryable,
     QueryParams,
     UpdateFeatureParams,
@@ -116,15 +117,15 @@ export class DuckDBProvider extends BaseProvider {
         ];
     }
 
-    async getCollections(): Promise<Collection[]> {
+    async getCollections(_req: ProviderRequest): Promise<Collection[]> {
         return Array.from(this.collections.values());
     }
 
-    async getCollection(collectionId: string): Promise<Collection | null> {
+    async getCollection(_req: ProviderRequest, collectionId: string): Promise<Collection | null> {
         return this.collections.get(collectionId) || null;
     }
 
-    async getSchema(collectionId: string): Promise<Record<string, unknown>> {
+    async getSchema(_req: ProviderRequest, collectionId: string): Promise<Record<string, unknown>> {
         if (!this.connection) throw new Error('Database not initialized');
 
         const columns = await this.connection.runAndReadAll(`
@@ -158,6 +159,7 @@ export class DuckDBProvider extends BaseProvider {
     }
 
     async getFeatures(
+        _req: ProviderRequest,
         collectionId: string,
         params: QueryParams
     ): Promise<FeatureCollection> {
@@ -243,7 +245,7 @@ export class DuckDBProvider extends BaseProvider {
         return result?.count || 0;
     }
 
-    async getFeature(collectionId: string, featureId: string): Promise<Feature> {
+    async getFeature(_req: ProviderRequest, collectionId: string, featureId: string): Promise<Feature> {
         if (!this.connection) throw new Error('Database not initialized');
 
         const geomCol = await this.connection.runAndReadAll(`
@@ -286,8 +288,8 @@ export class DuckDBProvider extends BaseProvider {
         };
     }
 
-    async getQueryables(collectionId: string): Promise<Queryable> {
-        const schema = await this.getSchema(collectionId);
+    async getQueryables(req: ProviderRequest, collectionId: string): Promise<Queryable> {
+        const schema = await this.getSchema(req, collectionId);
 
         return {
             type: 'object',
@@ -298,7 +300,7 @@ export class DuckDBProvider extends BaseProvider {
         };
     }
 
-    async createFeature(collectionId: string, feature: Feature): Promise<Feature | null> {
+    async createFeature(req: ProviderRequest, collectionId: string, feature: Feature): Promise<Feature | null> {
         if (!this.connection) throw new Error('Database not initialized');
 
         const columns = Object.keys(feature.properties || {});
@@ -322,13 +324,14 @@ export class DuckDBProvider extends BaseProvider {
         const result = await this.connection.runAndReadAll(query, values);
 
         if (result) {
-            return await this.getFeature(collectionId, result.id || result.fid);
+            return await this.getFeature(req, collectionId, result.id || result.fid);
         }
 
         return null;
     }
 
     async replaceFeature(
+        req: ProviderRequest,
         collectionId: string,
         featureId: string,
         feature: Feature
@@ -348,10 +351,11 @@ export class DuckDBProvider extends BaseProvider {
 
         await this.connection.run(query, [...values, featureId, featureId]);
 
-        return await this.getFeature(collectionId, featureId);
+        return await this.getFeature(req, collectionId, featureId);
     }
 
     async updateFeature(
+        req: ProviderRequest,
         collectionId: string,
         featureId: string,
         params: UpdateFeatureParams
@@ -372,10 +376,10 @@ export class DuckDBProvider extends BaseProvider {
 
         await this.connection.run(query, [...values, featureId, featureId]);
 
-        return await this.getFeature(collectionId, featureId);
+        return await this.getFeature(req, collectionId, featureId);
     }
 
-    async deleteFeature(collectionId: string, featureId: string): Promise<boolean> {
+    async deleteFeature(_req: ProviderRequest, collectionId: string, featureId: string): Promise<boolean> {
         if (!this.connection) throw new Error('Database not initialized');
 
         const query = `DELETE FROM ${collectionId} WHERE id = ? OR fid = ?`;

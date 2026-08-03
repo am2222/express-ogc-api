@@ -5,6 +5,7 @@ import type {
   Feature,
   FeatureCollection,
   FunctionMetadata,
+  ProviderRequest,
   Queryable,
   QueryParams,
   UpdateFeatureParams,
@@ -58,15 +59,18 @@ export class InMemoryProvider extends BaseProvider {
     }
   }
 
-  async getSchema(collectionId: string): Promise<Record<string, unknown>> {
-    const collection = await this.getCollection(collectionId);
+  async getSchema(
+    req: ProviderRequest,
+    collectionId: string
+  ): Promise<Record<string, unknown>> {
+    const collection = await this.getCollection(req, collectionId);
 
     if (!collection) {
       throw new Error('Collection not found');
     }
 
     // Get a sample feature to infer schema
-    const features = await this.getFeatures(collectionId, { limit: 1 });
+    const features = await this.getFeatures(req, collectionId, { limit: 1 });
     const sampleFeature = features.features[0];
 
     // Build properties schema from sample feature
@@ -119,15 +123,19 @@ export class InMemoryProvider extends BaseProvider {
     }
   }
 
-  async getCollections(): Promise<Collection[]> {
+  async getCollections(_req: ProviderRequest): Promise<Collection[]> {
     return Array.from(this.collections.values());
   }
 
-  async getCollection(collectionId: string): Promise<Collection | null> {
+  async getCollection(
+    _req: ProviderRequest,
+    collectionId: string
+  ): Promise<Collection | null> {
     return this.collections.get(collectionId) || null;
   }
 
   async getFeatures(
+    _req: ProviderRequest,
     collectionId: string,
     params: QueryParams
   ): Promise<FeatureCollection> {
@@ -196,6 +204,7 @@ export class InMemoryProvider extends BaseProvider {
   }
 
   getFeature(
+    _req: ProviderRequest,
     collectionId: string,
     featureId: string
   ): Feature | Promise<Feature> | null {
@@ -207,7 +216,10 @@ export class InMemoryProvider extends BaseProvider {
   }
 
   // Part 3: Filtering support
-  async getQueryables(collectionId: string): Promise<Queryable> {
+  async getQueryables(
+    _req: ProviderRequest,
+    collectionId: string
+  ): Promise<Queryable> {
     const collection = this.collections.get(collectionId);
     if (!collection) {
       throw new Error('Collection not found');
@@ -247,6 +259,7 @@ export class InMemoryProvider extends BaseProvider {
 
   // Part 4: CRUD operations
   async createFeature(
+    _req: ProviderRequest,
     collectionId: string,
     feature: Feature
   ): Promise<Feature | null> {
@@ -265,6 +278,7 @@ export class InMemoryProvider extends BaseProvider {
   }
 
   async replaceFeature(
+    _req: ProviderRequest,
     collectionId: string,
     featureId: string,
     feature: Feature
@@ -280,6 +294,7 @@ export class InMemoryProvider extends BaseProvider {
   }
 
   async updateFeature(
+    _req: ProviderRequest,
     collectionId: string,
     featureId: string,
     params: UpdateFeatureParams
@@ -302,6 +317,7 @@ export class InMemoryProvider extends BaseProvider {
   }
 
   async deleteFeature(
+    _req: ProviderRequest,
     collectionId: string,
     featureId: string
   ): Promise<boolean> {

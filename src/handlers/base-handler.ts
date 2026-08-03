@@ -6,12 +6,12 @@ import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 import type { Exception, OGCFeaturesConfig } from '@/types';
 
 export class BaseHandler {
-  provider: BaseProvider;
+  provider: BaseProvider<any, any>;
   requiredCoreClasses: OGCAPIConformanceItem[] = [];
   basePath: string = '/';
   options: OGCFeaturesConfig = {};
 
-  constructor(provider: BaseProvider, options: OGCFeaturesConfig = {}) {
+  constructor(provider: BaseProvider<any, any>, options: OGCFeaturesConfig = {}) {
     this.provider = provider;
     this.options = options;
     if (options.basePath) {
@@ -33,12 +33,6 @@ export class BaseHandler {
       res.status(400).json({ error: 'Invalid request body' });
       return;
     }
-    next();
-  }
-
-  preProviderHook(req: Request, res: Response, next: NextFunction): void {
-    // Hook to run before provider methods
-    this.provider.preProviderHook(req, res);
     next();
   }
 

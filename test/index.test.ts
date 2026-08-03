@@ -2,13 +2,13 @@
 // biome-ignore assist/source/organizeImports: <explanation>
 import { describe, it, beforeAll, afterAll, expect } from 'vitest';
 import express from 'express';
+import type { AddressInfo } from 'node:net';
 import { OGCAPI, InMemoryProvider } from '../src/index.js';
 
 describe('OGC API LandingPage', () => {
   let app: express.Express;
   let server: import('http').Server;
-  const port = 3001;
-  const baseUrl = `http://localhost:${port}`;
+  let baseUrl: string;
 
   beforeAll(() => {
     app = express();
@@ -103,7 +103,8 @@ describe('OGC API LandingPage', () => {
       description: 'Test Description',
     });
     app.use('/ogc', ogcAPIRoutes.getRouter());
-    server = app.listen(port);
+    server = app.listen(0);
+    baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
   });
 
   afterAll(() => {

@@ -1,7 +1,7 @@
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 
-import type { FeatureCollection, Link, QueryParams } from '@/types';
+import type { FeatureCollection, Link, ProviderRequest, QueryParams } from '@/types';
 import type { NextFunction, Request, Response, Router } from 'express';
 
 export class ItemsCURDHandler extends BaseHandler {
@@ -100,6 +100,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const params = this.parseQueryParams(req);
 
       const featureCollection = await this.provider.getFeatures(
+        req as ProviderRequest,
         collectionId,
         params
       );
@@ -181,14 +182,21 @@ export class ItemsCURDHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId, featureId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
 
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');
         return;
       }
 
-      const feature = await this.provider.getFeature(collectionId, featureId);
+      const feature = await this.provider.getFeature(
+        req as ProviderRequest,
+        collectionId,
+        featureId
+      );
 
       if (!feature) {
         this.sendError(res, 404, 'Feature not found');
@@ -209,12 +217,18 @@ export class ItemsCURDHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');
         return;
       }
-      const queryables = await this.provider.getQueryables(collectionId);
+      const queryables = await this.provider.getQueryables(
+        req as ProviderRequest,
+        collectionId
+      );
       res.json(queryables);
     } catch (err) {
       next(err);
@@ -229,14 +243,21 @@ export class ItemsCURDHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');
         return;
       }
       const feature = req.body;
 
-      const created = await this.provider.createFeature(collectionId, feature);
+      const created = await this.provider.createFeature(
+        req as ProviderRequest,
+        collectionId,
+        feature
+      );
 
       if (!created) {
         this.sendError(res, 500, 'Failed to create feature');
@@ -264,6 +285,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const feature = req.body;
 
       const replaced = await this.provider.replaceFeature(
+        req as ProviderRequest,
         collectionId,
         featureId,
         feature
@@ -290,6 +312,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const updates = req.body;
 
       const updated = await this.provider.updateFeature(
+        req as ProviderRequest,
         collectionId,
         featureId,
         { feature: updates }
@@ -315,6 +338,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const { collectionId, featureId } = req.params;
 
       const deleted = await this.provider.deleteFeature(
+        req as ProviderRequest,
         collectionId,
         featureId
       );

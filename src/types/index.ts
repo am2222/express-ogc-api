@@ -144,6 +144,11 @@ export interface ConformsTo {
 }
 // Configuration export interface
 export interface OGCFeaturesConfig {
+  /**
+   * Optional public prefix override for generated links. Leave unset to follow
+   * the mount path (`req.baseUrl`), which is required when mounting at a
+   * parametrized path such as `/root/:dbid`.
+   */
   basePath?: string;
   title?: string;
   description?: string;
@@ -154,3 +159,20 @@ export interface LandingPage {
   description?: string;
   links: Link[];
 }
+
+import type { Request, Response } from 'express';
+import type { ParsedQs } from 'qs';
+
+/**
+ * The Express request as seen by a provider.
+ *
+ * `res` is declared non-optional: Express assigns the `req.res` back-reference
+ * during dispatch, so it is always present inside a handler-invoked provider
+ * method. Use `req.res.locals` to read whatever your middleware attached.
+ */
+export type ProviderRequest<
+  TParams extends Record<string, string> = Record<string, string>,
+  TLocals extends Record<string, any> = Record<string, any>,
+> = Request<TParams, any, any, ParsedQs, TLocals> & {
+  res: Response<any, TLocals>;
+};
