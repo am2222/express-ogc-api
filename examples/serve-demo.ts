@@ -107,7 +107,11 @@ const server = app.listen(port, () => {
   // A fresh token each boot, so the printed URLs are always usable. Restarting
   // the server invalidates nothing (the old token stays valid until it
   // expires) — it just issues another one.
-  const token = getToken({ db: 'demo', sub: 'demo-user' });
+  //
+  // Read-only on purpose. These URLs are the ones you paste into QGIS, and QGIS
+  // saves them into its project file — so this is exactly the token most likely
+  // to end up somewhere you didn't intend. Writes need `mint-token.ts --rw`.
+  const token = getToken({ db: 'demo', sub: 'demo-user', scope: 'ro' });
   const base = `http://localhost:${port}/${token}/ogc`;
   console.log('🌍 Demo OGC API - Features server');
   console.log('================================');
@@ -118,8 +122,12 @@ const server = app.listen(port, () => {
   console.log(`  Lines:                            ${base}/collections/lines/items`);
   console.log(`  Polygons:                         ${base}/collections/polygons/items`);
   console.log('');
-  console.log(`  Token expires in ${TOKEN_TTL}. Mint another:  npx tsx examples/mint-token.ts demo`);
-  console.log('  A bad, tampered-with or expired token gets 403 Invalid or expired token.');
+  console.log(`  The token above is READ-ONLY and expires in ${TOKEN_TTL}.`);
+  console.log('  Writes (POST/PUT/PATCH/DELETE) need a read-write token:');
+  console.log(`    npx tsx examples/mint-token.ts demo --rw --port ${port}`);
+  console.log('');
+  console.log('  403 Invalid or expired token          — bad, tampered-with or expired token');
+  console.log('  403 Token is read-only; …             — valid token, but a write with scope=ro');
   console.log('');
   console.log('Press Ctrl+C to stop');
 });

@@ -146,6 +146,108 @@ describe('demo JWT-in-path gate', () => {
     expect(res.status).toBe(403);
   });
 
+  describe('scope claim', () => {
+    function write(token: string, method: string, path: string, body?: unknown) {
+      return fetch(`${base}/${token}/ogc${path}`, {
+        method,
+        headers: { 'content-type': 'application/geo+json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    }
+
+    it('lets a read-write token actually write', async () => {
+      const rw = getToken({ db: 'demo', scope: 'rw' });
+
+      const created = await write(rw, 'POST', '/collections/cities/items', {
+        type: 'Feature',
+        id: 100,
+        geometry: null,
+        properties: { id: 100, name: 'Written City' },
+      });
+      expect(created.status).toBe(201);
+
+      // Asserting the write landed, not merely that the gate let it past —
+      // otherwise this test would still pass if the handler silently no-oped.
+      const read = await get(rw, '/collections/cities/items/100');
+      expect(read.status).toBe(200);
+      expect(((await read.json()) as any).properties.name).toBe('Written City');
+
+      expect((await write(rw, 'DELETE', '/collections/cities/items/100')).status).toBe(204);
+    });
+
+    it('refuses every write method for a read-only token, with a distinguishable reason', async () => {
+      const ro = getToken({ db: 'demo', scope: 'ro' });
+
+      for (const [method, path] of [
+        ['POST', '/collections/cities/items'],
+        ['PUT', '/collections/cities/items/1'],
+        ['PATCH', '/collections/cities/items/1'],
+        ['DELETE', '/collections/cities/items/1'],
+      ] as const) {
+        const res = await write(ro, method, path, {
+          type: 'Feature',
+          geometry: null,
+          properties: { name: 'nope' },
+        });
+        expect(res.status, method).toBe(403);
+        const body = (await res.json()) as { description: string };
+        expect(body.description, method).toContain('read-only');
+        expect(body.description, method).toContain(method);
+      }
+
+      // And the row it tried to touch is untouched.
+      const survivor = await get(ro, '/collections/cities/items/1');
+      expect(survivor.status).toBe(200);
+      expect(((await survivor.json()) as any).properties.name).toBe('Demo City');
+    });
+
+    it('still allows reads for a read-only token', async () => {
+      const ro = getToken({ db: 'demo', scope: 'ro' });
+      expect((await get(ro, '/collections/cities/items')).status).toBe(200);
+      expect((await write(ro, 'HEAD', '/collections')).status).toBe(200);
+    });
+
+    it('treats a token with no scope claim as read-only', async () => {
+      // Fails closed. A token minted without thinking about scope must not get
+      // write access by default.
+      const noScope = getToken({ db: 'demo' });
+      expect((await get(noScope, '/collections')).status).toBe(200);
+      expect(
+        (await write(noScope, 'DELETE', '/collections/cities/items/1')).status
+      ).toBe(403);
+    });
+
+    it('treats an unrecognized scope value as read-only, not as permissive', async () => {
+      // Only the exact string 'rw' grants writes, so a typo in a mint call
+      // degrades to read-only instead of silently handing out DELETE.
+      for (const scope of ['RW', 'rw ', 'write', 'admin', '', 1, null, ['rw']]) {
+        const token = jwt.sign({ db: 'demo', scope }, SECRET_KEY, { expiresIn: '8h' });
+        const res = await write(token, 'DELETE', '/collections/cities/items/1');
+        expect(res.status, JSON.stringify(scope)).toBe(403);
+      }
+
+      expect((await get(getToken({ db: 'demo' }), '/collections/cities/items/1')).status).toBe(200);
+    });
+
+    it('does not let scope=rw substitute for a valid signature, live token or known db', async () => {
+      // Scope widens what a *valid* token may do; it must never be a way around
+      // verification itself.
+      const forged = jwt.sign({ db: 'demo', scope: 'rw' }, 'attacker-secret', { expiresIn: '8h' });
+      const expired = jwt.sign({ db: 'demo', scope: 'rw' }, SECRET_KEY, { expiresIn: '-1h' });
+      const otherTenant = jwt.sign({ db: 'globex', scope: 'rw' }, SECRET_KEY, { expiresIn: '8h' });
+
+      for (const token of [forged, expired, otherTenant]) {
+        const res = await write(token, 'DELETE', '/collections/cities/items/1');
+        expect(res.status).toBe(403);
+        // The vague message, not the read-only one — these tokens are not
+        // usable at all, and saying which check failed would help a prober.
+        expect(((await res.json()) as { description: string }).description).toBe(
+          'Invalid or expired token'
+        );
+      }
+    });
+  });
+
   it('does not distinguish failure reasons in its response', async () => {
     // Same status and same body for every rejection: telling a caller *why*
     // their token failed tells someone probing with guesses which part of the

@@ -660,6 +660,60 @@ app.use((req, res, next) => {
 value you mount at, nothing changes and you can delete it. Do not set it when
 mounting at a parametrized path — it cannot know the resolved param values.
 
+**Capability flags are now declared, not inferred.** `BaseProvider` used to
+guess `enableSchemas`, `enableFiltering` and `enableTransactions` by comparing
+your subclass's prototype methods against `BaseProvider.prototype`. Because
+every one of those methods is `abstract`, that comparison was always true —
+the flags were effectively hardcoded to `true` (except `enableCrs`, which no
+code path ever set, so it was always `false`). This never worked as
+"detection"; it's being replaced with explicit fields so behavior is honest
+and predictable. Every custom provider must now declare which capabilities it
+supports:
+
+- `enableSchemas` — activates `GET /collections/{id}/schema` and the Part 5
+  "Schemas" conformance class.
+- `enableFiltering` — activates `GET /collections/{id}/queryables` and makes
+  the `filter`/`filter-lang` query parameters live.
+- `enableTransactions` — activates `POST`/`PUT`/`PATCH`/`DELETE` on the items
+  endpoints and advertises them in the `OPTIONS` `Allow` header.
+- `enableCrs` — makes the `crs`, `bbox-crs` and `filter-crs` query parameters
+  live. (The two bundled providers, `InMemoryProvider` and `DuckDBProvider`,
+  leave this `false`: neither performs CRS transformation, so turning the
+  parameters on would silently accept and ignore them.)
+
+**If you don't set these explicitly, they now default to `false`** and your
+provider will silently lose whichever capabilities it used to get for free —
+before:
+
+```typescript
+class MyProvider extends BaseProvider {
+  // no capability flags — used to work anyway, because the old detection
+  // saw MyProvider's getSchema/getFeatures/createFeature overrides and
+  // turned everything on automatically
+  async getSchema(req, collectionId) { /* ... */ }
+  async getFeatures(req, collectionId, params) { /* ... */ }
+  async createFeature(req, collectionId, feature) { /* ... */ }
+  async updateFeature(req, collectionId, featureId, params) { /* ... */ }
+  async deleteFeature(req, collectionId, featureId) { /* ... */ }
+}
+```
+
+after:
+
+```typescript
+class MyProvider extends BaseProvider {
+  public override readonly enableSchemas = true;
+  public override readonly enableFiltering = true;
+  public override readonly enableTransactions = true;
+
+  async getSchema(req, collectionId) { /* ... */ }
+  async getFeatures(req, collectionId, params) { /* ... */ }
+  async createFeature(req, collectionId, feature) { /* ... */ }
+  async updateFeature(req, collectionId, featureId, params) { /* ... */ }
+  async deleteFeature(req, collectionId, featureId) { /* ... */ }
+}
+```
+
 ## Releasing
 
 Releases are automated, and the two GitHub Actions badges at the top of this file

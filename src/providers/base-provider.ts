@@ -1,6 +1,7 @@
 // biome-ignore assist/source/organizeImports: <explanation>
 import type {
   Collection,
+  CollectionSchema,
   Feature,
   FeatureCollection,
   ProviderRequest,
@@ -20,8 +21,37 @@ export abstract class BaseProvider<
 > {
   public name: string;
 
+  /**
+   * Declares that this provider's `getSchema` is genuinely implemented.
+   * Setting this to `true` activates `GET /collections/{id}/schema` (see
+   * `SchemaHandler.isProviderConformed`) and folds the Part 5 "Schemas"
+   * conformance class into `conformanceClasses()` (via
+   * `schemaConformanceClasses()`). Must be declared explicitly by every
+   * concrete subclass that supports it — see "Migrating" in the README for
+   * why this can no longer be detected automatically.
+   */
   public readonly enableSchemas: boolean = false;
+
+  /**
+   * Declares that this provider's `getFeatures`/`getQueryables` genuinely
+   * support filtering. Setting this to `true` activates
+   * `GET /collections/{id}/queryables` and makes the `filter` and
+   * `filter-lang` query parameters live in `ItemsCURDHandler.parseQueryParams`
+   * (otherwise they are silently ignored). Must be declared explicitly by
+   * every concrete subclass that supports it.
+   */
   public readonly enableFiltering: boolean = false;
+
+  /**
+   * Declares that this provider performs CRS transformation rather than
+   * merely advertising `supportedCrs`/`defaultCrs`. Setting this to `true`
+   * makes the `crs`, `bbox-crs` and `filter-crs` query parameters live in
+   * `ItemsCURDHandler.parseQueryParams`, and turns on `crs`/`storageCrs` in
+   * collection responses (`CollectionHandler`). Leaving it `false` when a
+   * provider doesn't actually transform CRS keeps those parameters honestly
+   * inert instead of accepted-but-ignored. Must be declared explicitly by
+   * every concrete subclass that supports it.
+   */
   public readonly enableCrs: boolean = false;
 
   public readonly supportedCrs: string[] = [
@@ -39,6 +69,15 @@ export abstract class BaseProvider<
 
   public readonly defaultIdFormat: string = 'string';
 
+  /**
+   * Declares that this provider's `createFeature`/`replaceFeature`/
+   * `updateFeature`/`deleteFeature` are genuinely implemented. Setting this
+   * to `true` activates the write endpoints (`POST`/`PUT`/`PATCH`/`DELETE`
+   * on `/collections/{id}/items[/{featureId}]`, see
+   * `ItemsCURDHandler.setupRoutes`) and advertises them in the `OPTIONS`
+   * `Allow` header (`RootHandler.handleOptionsRequests`). Must be declared
+   * explicitly by every concrete subclass that supports it.
+   */
   public readonly enableTransactions: boolean = false;
   public readonly defaultLimit: number = 100;
 
@@ -50,41 +89,6 @@ export abstract class BaseProvider<
       throw new TypeError('BaseProvider is abstract; use a concrete subclass');
     }
     this.name = providerDef.name;
-
-    //check if getSchema is implemented in subclass
-    const proto = Object.getPrototypeOf(this);
-    if (
-      proto.getSchema &&
-      proto.getSchema !== BaseProvider.prototype.getSchema
-    ) {
-      this.enableSchemas = true;
-    } else {
-      this.enableSchemas = false;
-    }
-
-    //check if crs handling is implemented in subclass
-    if (
-      proto.getFeatures &&
-      proto.getFeatures !== BaseProvider.prototype.getFeatures
-    ) {
-      this.enableFiltering = true;
-    } else {
-      this.enableFiltering = false;
-    }
-
-    // check if transactions are enabled
-    if (
-      proto.createFeature &&
-      proto.createFeature !== BaseProvider.prototype.createFeature &&
-      proto.updateFeature &&
-      proto.updateFeature !== BaseProvider.prototype.updateFeature &&
-      proto.deleteFeature &&
-      proto.deleteFeature !== BaseProvider.prototype.deleteFeature
-    ) {
-      this.enableTransactions = true;
-    } else {
-      this.enableTransactions = false;
-    }
   }
 
   /**
@@ -119,7 +123,7 @@ export abstract class BaseProvider<
   abstract getSchema(
     req: ProviderRequest<TParams, TLocals>,
     collectionId: string
-  ): Promise<Record<string, unknown>> | Record<string, unknown>;
+  ): Promise<CollectionSchema> | CollectionSchema;
 
   abstract createFeature(
     req: ProviderRequest<TParams, TLocals>,

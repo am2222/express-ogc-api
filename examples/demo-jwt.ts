@@ -35,10 +35,33 @@ export const SECRET_KEY =
 
 export const TOKEN_TTL = '8h';
 
+/**
+ * What a token is allowed to do. `ro` permits the safe methods only; `rw` also
+ * permits POST/PUT/PATCH/DELETE.
+ *
+ * The split exists because of how this scheme propagates. A token in the URL
+ * ends up inside every link the API returns, which means it gets saved into
+ * client-side artifacts — a QGIS `.qgs`/`.qgz` project file, most obviously —
+ * and those get emailed around and committed to repos. A read-only token
+ * leaking that way costs you a data read. A read-write token leaking that way
+ * costs you `DELETE` on every feature in the tenant until it expires. So the
+ * token you paste into a GIS client should be `ro`, and writes should need a
+ * separately minted `rw` token that never goes near a saved project file.
+ */
+export type DemoScope = 'ro' | 'rw';
+
+/** HTTP methods a read-only token may use. */
+const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
 /** Claims the demo cares about. `db` selects which tenant the token unlocks. */
 export interface DemoClaims {
   /** Tenant key — becomes `res.locals.key`, so it must be a known tenant. */
   db: string;
+  /**
+   * Read-only or read-write. Optional, and **absence means `ro`** — see
+   * `isReadWrite` below for why it fails closed rather than open.
+   */
+  scope?: DemoScope;
   /** Who the token was issued to. Not used for authorization here. */
   sub?: string;
 }
@@ -70,23 +93,44 @@ export function useToken(token: string): VerifiedClaims | false {
 }
 
 /**
+ * Whether a set of verified claims permits writes.
+ *
+ * Fails closed: only the exact string `rw` grants write access. A token with
+ * no `scope`, an empty one, a misspelled one (`"write"`, `"RW"`), or a
+ * non-string one is read-only. The alternative — treating an unrecognized
+ * scope as permissive — would mean a typo in a mint call silently hands out
+ * `DELETE`, which is the wrong direction to be wrong in.
+ */
+export function isReadWrite(claims: VerifiedClaims): boolean {
+  return claims.scope === 'rw';
+}
+
+/**
  * Middleware for a router mounted at `/:token/ogc`: verifies `req.params.token`
  * and, on success, resolves the tenant from the token's `db` claim onto
  * `res.locals.key` (which `PrefixedDuckDBProvider` reads) and the full claims
  * onto `res.locals.claims`.
  *
- * Failure modes, all 403 with an OGC-style exception body:
+ * Two distinct rejections, both 403:
  *
- * - token missing, malformed, badly signed, or expired
- * - token verifies but carries no usable `db` claim
- * - token verifies but names a database this server doesn't serve
+ * 1. **The token isn't usable at all** — missing, malformed, badly signed,
+ *    expired, carrying no usable `db` claim, or naming a database this server
+ *    doesn't serve. These deliberately share one status and one vague
+ *    description: distinguishing "expired" from "bad signature" from "unknown
+ *    database" tells someone probing with guessed tokens which part of their
+ *    guess was right.
  *
- * They deliberately share one status and one generic-ish description rather
- * than reporting "expired" vs "bad signature" vs "unknown database"
- * separately: distinguishing them tells an attacker probing with guessed
- * tokens which part of their guess was right. 403 (rather than 401) because
- * there is no `WWW-Authenticate` challenge to issue — the client can't fix
- * this by retrying with credentials, it needs a different token.
+ * 2. **The token is valid but read-only, and this is a write.** This one *is*
+ *    reported specifically, and that's not an inconsistency with the above.
+ *    The caller has already proven they hold a validly signed token, so naming
+ *    the reason leaks nothing they couldn't determine anyway — and a client
+ *    that gets an opaque 403 on a write it's allowed to make in principle has
+ *    no way to tell "my token expired" from "my token is the read-only one",
+ *    which is a genuinely confusing thing to debug.
+ *
+ * 403 rather than 401 in both cases because there is no `WWW-Authenticate`
+ * challenge to issue — the client can't fix this by retrying with credentials,
+ * it needs a different token.
  */
 export function requireToken(knownTenants: Set<string>): RequestHandler {
   return (req, res, next) => {
@@ -111,6 +155,17 @@ export function requireToken(knownTenants: Set<string>): RequestHandler {
 
     if (typeof claims.db !== 'string' || !knownTenants.has(claims.db)) {
       deny();
+      return;
+    }
+
+    // Method check, not path check. Guarding by URL would mean every route
+    // added later has to be remembered here; guarding by method means a new
+    // write route is covered the moment it exists.
+    if (!READ_METHODS.has(req.method) && !isReadWrite(claims)) {
+      res.status(403).json({
+        code: '403',
+        description: `Token is read-only; ${req.method} requires a read-write token`,
+      });
       return;
     }
 

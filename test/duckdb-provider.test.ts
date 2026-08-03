@@ -3,7 +3,7 @@ import { DuckDBInstance } from '@duckdb/node-api';
 import type { DuckDBConnection } from '@duckdb/node-api';
 import express from 'express';
 import type { AddressInfo } from 'node:net';
-import { DuckDBProvider, OGCAPI, FeatureValidationError } from '../src/index.js';
+import { DuckDBProvider, OGCAPI, FeatureValidationError, Cql2Error, Cql2ToSql } from '../src/index.js';
 import type { ProviderRequest } from '../src/index.js';
 import type { DuckDBLocals } from '../src/index.js';
 
@@ -78,6 +78,77 @@ describe('DuckDBProvider', () => {
     await db.run(`
       CREATE TABLE attributes_only (id INTEGER PRIMARY KEY, label VARCHAR);
       INSERT INTO attributes_only VALUES (1, 'A');
+    `);
+
+    // A table exercising every `format`/`description`/binary-serialization
+    // addition: `DATE`, `TIMESTAMP`, `TIMESTAMP WITH TIME ZONE` (deliberately
+    // alongside plain `TIMESTAMP`, so a substring-ordering bug that
+    // misclassifies one as the other has something to fail against), `TIME`
+    // (one row with a whole-second value, one with a fractional one), `UUID`,
+    // and `BLOB`. `label` carries a column comment; `created_date` does not,
+    // so the "no comment -> no description key" case has something to check
+    // against in the same table. `geom` is single-type (POINT only), for the
+    // `geometry-point` format case.
+    await db.run(`
+      CREATE TABLE richly_typed (
+        id INTEGER PRIMARY KEY,
+        label VARCHAR,
+        created_date DATE,
+        created_at TIMESTAMP,
+        created_at_tz TIMESTAMP WITH TIME ZONE,
+        opens_at TIME,
+        external_id UUID,
+        payload BLOB,
+        geom GEOMETRY
+      );
+      COMMENT ON COLUMN richly_typed.label IS 'A human-friendly label';
+
+      INSERT INTO richly_typed VALUES (
+        1, 'Alpha',
+        DATE '2024-01-15',
+        TIMESTAMP '2024-01-15 10:30:00',
+        TIMESTAMP WITH TIME ZONE '2024-01-15 10:30:00+00',
+        TIME '03:04:05',
+        UUID '123e4567-e89b-12d3-a456-426614174000',
+        'hi'::BLOB,
+        ST_Point(0, 0)
+      );
+      INSERT INTO richly_typed VALUES (
+        2, 'Beta',
+        DATE '2024-02-20',
+        TIMESTAMP '2024-02-20 08:00:00',
+        TIMESTAMP WITH TIME ZONE '2024-02-20 08:00:00+00',
+        TIME '12:00:00.25',
+        UUID '223e4567-e89b-12d3-a456-426614174001',
+        'AB'::BLOB,
+        ST_Point(1, 1)
+      );
+    `);
+
+    // Mixed geometry types (POINT and LINESTRING both present) — the
+    // `geometry-any` fallback, distinct from the "no rows" and "all null"
+    // cases below.
+    await db.run(`
+      CREATE TABLE mixed_geometry (id INTEGER PRIMARY KEY, geom GEOMETRY);
+      INSERT INTO mixed_geometry VALUES
+        (1, ST_Point(0, 0)),
+        (2, ST_GeomFromText('LINESTRING(0 0, 1 1)'));
+    `);
+
+    // Every geometry value NULL — also `geometry-any`, distinct from "mixed".
+    await db.run(`
+      CREATE TABLE all_null_geometry (id INTEGER PRIMARY KEY, geom GEOMETRY);
+      INSERT INTO all_null_geometry VALUES (1, NULL), (2, NULL);
+    `);
+
+    // For the CQL2 `filter` parameterisation test: a name containing a
+    // literal single quote. `O''Brien` is how CQL2-text escapes it; if the
+    // literal were ever concatenated into the SQL instead of bound, this
+    // would either break the query outright or (worse) silently match the
+    // wrong rows.
+    await db.run(`
+      CREATE TABLE people (id INTEGER PRIMARY KEY, name VARCHAR);
+      INSERT INTO people VALUES (1, 'O''Brien'), (2, 'Smith');
     `);
 
     provider = new DuckDBProvider({ name: 'DuckDBProvider' });
@@ -252,6 +323,52 @@ describe('DuckDBProvider', () => {
     }
   });
 
+  it('serves TIME/BLOB/DATE serialization and schema format/description/contentEncoding over real HTTP', async () => {
+    const app = express();
+    app.use((_req, res, next) => {
+      res.locals.db = db;
+      next();
+    });
+    const ogc = new OGCAPI(provider, app, {});
+    app.use(ogc.getRouter());
+
+    const server = app.listen(0);
+    const baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+
+    try {
+      const schemaRes = await fetch(`${baseUrl}/collections/richly_typed/schema`);
+      const schema = (await schemaRes.json()) as {
+        properties: Record<
+          string,
+          { type?: string; format?: string; description?: string; contentEncoding?: string }
+        >;
+      };
+      expect(schema.properties.opens_at.format).toBe('time');
+      expect(schema.properties.created_date.format).toBe('date');
+      expect(schema.properties.created_at_tz.format).toBe('date-time');
+      expect(schema.properties.label.description).toBe('A human-friendly label');
+      expect(schema.properties.payload.contentEncoding).toBe('base64');
+      expect(schema.properties.geom.format).toBe('geometry-point');
+
+      const itemsRes = await fetch(`${baseUrl}/collections/richly_typed/items`);
+      expect(itemsRes.status).toBe(200);
+      const body = (await itemsRes.text());
+      // Serialized JSON, over the wire, actually parses — this is what would
+      // throw if a raw Uint8Array/bigint ever reached res.json() unconverted.
+      const fc = JSON.parse(body) as { features: Array<{ properties: Record<string, unknown> }> };
+      const alpha = fc.features.find((f) => f.properties.label === 'Alpha');
+      expect(alpha?.properties.opens_at).toBe('03:04:05');
+      expect(alpha?.properties.payload).toBe(Buffer.from('hi').toString('base64'));
+      // A bare date, per `format: 'date'` — NOT a full ISO instant
+      // ('2024-01-15T00:00:00.000Z'), which is what this used to (wrongly)
+      // serialize as before the DATE-vs-TIMESTAMP fix.
+      expect(alpha?.properties.created_date).toBe('2024-01-15');
+      expect(alpha?.properties.created_at_tz).toBe('2024-01-15T10:30:00.000Z');
+    } finally {
+      server.close();
+    }
+  });
+
   it('omits the enum rather than guessing when a data_type does not parse cleanly as ENUM(...)', async () => {
     // Exercise the parser directly through the class's private method the
     // same way the rest of this suite reaches other internals — a
@@ -298,6 +415,163 @@ describe('DuckDBProvider', () => {
     expect(properties.name.maxLength).toBe(50);
     // A column DuckDB didn't report a length for must not get a guessed one.
     expect(properties.surface.maxLength).toBeUndefined();
+  });
+
+  it('maps DATE/TIMESTAMP/TIMESTAMP WITH TIME ZONE/TIME/UUID to their JSON Schema formats, without the TIMESTAMP/TIME substring collision', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'richly_typed');
+    const properties = schema.properties as Record<string, { type?: string; format?: string }>;
+
+    expect(properties.created_date).toMatchObject({ type: 'string', format: 'date' });
+    // Both TIMESTAMP variants map to 'date-time' — in particular
+    // `created_at_tz` (TIMESTAMP WITH TIME ZONE) must NOT come out as
+    // 'time' just because its data_type string contains "TIME ZONE".
+    expect(properties.created_at).toMatchObject({ type: 'string', format: 'date-time' });
+    expect(properties.created_at_tz).toMatchObject({ type: 'string', format: 'date-time' });
+    // And the reverse must also hold: a genuine TIME column must not be
+    // swept into 'date-time' by an overly broad TIMESTAMP check.
+    expect(properties.opens_at).toMatchObject({ type: 'string', format: 'time' });
+    expect(properties.external_id).toMatchObject({ type: 'string', format: 'uuid' });
+  });
+
+  it('emits contentEncoding: base64 for a BLOB column in the schema', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'richly_typed');
+    const properties = schema.properties as Record<string, { type?: string; contentEncoding?: string }>;
+
+    expect(properties.payload.type).toBe('string');
+    expect(properties.payload.contentEncoding).toBe('base64');
+  });
+
+  it('emits description from a column comment, and omits it entirely when there is none', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'richly_typed');
+    const properties = schema.properties as Record<string, { description?: string }>;
+
+    expect(properties.label.description).toBe('A human-friendly label');
+    // No COMMENT ON COLUMN was set for created_date — the key must be
+    // entirely absent, not present-and-null or present-and-empty.
+    expect(properties.created_date.description).toBeUndefined();
+    expect('description' in properties.created_date).toBe(false);
+  });
+
+  it('reports a specific geometry-<type> format for a single-type geometry column', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'richly_typed');
+    const properties = schema.properties as Record<string, { format?: string }>;
+
+    // richly_typed's geom column holds POINT values only.
+    expect(properties.geom.format).toBe('geometry-point');
+  });
+
+  it('falls back to geometry-any when a geometry column mixes more than one type', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'mixed_geometry');
+    const properties = schema.properties as Record<string, { format?: string }>;
+
+    expect(properties.geom.format).toBe('geometry-any');
+  });
+
+  it('falls back to geometry-any when every value in a geometry column is null', async () => {
+    const schema = await provider.getSchema(fakeReq(db), 'all_null_geometry');
+    const properties = schema.properties as Record<string, { format?: string }>;
+
+    expect(properties.geom.format).toBe('geometry-any');
+  });
+
+  it('serializes a TIME column as an ISO clock string, not a raw bigint of microseconds', async () => {
+    const fc = await provider.getFeatures(fakeReq(db), 'richly_typed', { limit: 10 });
+
+    const alpha = fc.features.find((f) => f.properties.label === 'Alpha');
+    // Whole-second TIME value: no fractional-seconds suffix.
+    expect(alpha?.properties.opens_at).toBe('03:04:05');
+    expect(typeof alpha?.properties.opens_at).toBe('string');
+
+    const beta = fc.features.find((f) => f.properties.label === 'Beta');
+    // Fractional TIME value: '.25' must survive, not be dropped or rounded.
+    expect(beta?.properties.opens_at).toBe('12:00:00.25');
+
+    // Also verified via the single-feature read path, not just getFeatures.
+    const single = await provider.getFeature(fakeReq(db), 'richly_typed', '1');
+    expect(single?.properties.opens_at).toBe('03:04:05');
+
+    expect(() => JSON.stringify(fc)).not.toThrow();
+  });
+
+  it('serializes a DATE column as a bare YYYY-MM-DD string, using UTC components not local ones', async () => {
+    const originalTZ = process.env.TZ;
+    try {
+      // DuckDB's DATE value is a `Date` at UTC midnight, independent of the
+      // process's local timezone — but an implementation that formatted it
+      // with *local* getters (getFullYear/getMonth/getDate) instead of the
+      // UTC ones would read the previous local day on any machine west of
+      // UTC, silently shifting the value back by one. Forcing a UTC-negative
+      // zone here means that exact regression can't hide behind whatever
+      // timezone happens to run the test — a naive local-getter
+      // implementation reads 2024-01-15T00:00:00Z as 2024-01-14 in
+      // America/Los_Angeles (UTC-8).
+      process.env.TZ = 'America/Los_Angeles';
+
+      const fc = await provider.getFeatures(fakeReq(db), 'richly_typed', { limit: 10 });
+      const alpha = fc.features.find((f) => f.properties.label === 'Alpha');
+      expect(alpha?.properties.created_date).toBe('2024-01-15');
+      expect(typeof alpha?.properties.created_date).toBe('string');
+
+      const beta = fc.features.find((f) => f.properties.label === 'Beta');
+      expect(beta?.properties.created_date).toBe('2024-02-20');
+
+      // Also verified via the single-feature read path, not just getFeatures.
+      const single = await provider.getFeature(fakeReq(db), 'richly_typed', '1');
+      expect(single?.properties.created_date).toBe('2024-01-15');
+    } finally {
+      process.env.TZ = originalTZ;
+    }
+  });
+
+  it('leaves TIMESTAMP/TIMESTAMP WITH TIME ZONE as a full ISO instant — only DATE gets the bare YYYY-MM-DD treatment', async () => {
+    const fc = await provider.getFeatures(fakeReq(db), 'richly_typed', { limit: 10 });
+
+    // `rowToFeature`/`normalizeValue` don't touch TIMESTAMP/TIMESTAMPTZ at
+    // all — they pass the raw `Date` straight through, same as before this
+    // task — and it's `JSON.stringify` (via `res.json()` in real use, and
+    // explicitly here) that turns a `Date` into a full ISO instant through
+    // its own `toJSON()`. Round-tripping through JSON is what actually
+    // exercises that, rather than asserting on the still-a-`Date` value.
+    const parsed = JSON.parse(JSON.stringify(fc)) as { features: Array<{ properties: Record<string, unknown> }> };
+    const alpha = parsed.features.find((f) => f.properties.label === 'Alpha');
+
+    // Unchanged, pre-existing (and correct) behaviour: a TIMESTAMP/TIMESTAMPTZ
+    // value must still serialize as a full ISO instant, matching the
+    // `format: 'date-time'` the schema declares for these columns — the DATE
+    // fix must not have been over-applied to them.
+    expect(alpha?.properties.created_at).toBe('2024-01-15T10:30:00.000Z');
+    expect(alpha?.properties.created_at_tz).toBe('2024-01-15T10:30:00.000Z');
+  });
+
+  it('serializes a BLOB column as a base64 string, not {"0":...} byte-index JSON', async () => {
+    const fc = await provider.getFeatures(fakeReq(db), 'richly_typed', { limit: 10 });
+
+    const alpha = fc.features.find((f) => f.properties.label === 'Alpha');
+    expect(alpha?.properties.payload).toBe(Buffer.from('hi').toString('base64'));
+    expect(typeof alpha?.properties.payload).toBe('string');
+
+    const beta = fc.features.find((f) => f.properties.label === 'Beta');
+    expect(beta?.properties.payload).toBe(Buffer.from('AB').toString('base64'));
+
+    // Not the byte-indexed-object shape a raw Uint8Array would produce.
+    expect(JSON.stringify(fc)).not.toContain('"0":');
+  });
+
+  it('does not misclassify a genuine BIGINT column as TIME (disambiguation is column-type-driven, not value-shaped)', async () => {
+    // This table's BIGINT column holds a value that, read as TIME
+    // microseconds, would decode to a bogus but plausible-looking clock
+    // string ('12:30:45'). It must still come out as a plain number, per the
+    // existing BIGINT normalisation (F1) — proving TIME formatting is
+    // applied only to columns actually declared TIME, not to any bigint
+    // value that happens to arrive.
+    await db.run(`
+      CREATE TABLE big_not_time (id INTEGER PRIMARY KEY, big_value BIGINT);
+      INSERT INTO big_not_time VALUES (1, 45045000000);
+    `);
+
+    const fc = await provider.getFeatures(fakeReq(db), 'big_not_time', { limit: 10 });
+    expect(fc.features[0]?.properties.big_value).toBe(45045000000);
+    expect(fc.features[0]?.properties.big_value).not.toBe('12:30:45');
   });
 
   it('maps a POINT-family DuckDB type to "object", not "integer" (mapDuckDBTypeToJSON substring bug)', async () => {
@@ -603,4 +877,276 @@ describe('DuckDBProvider', () => {
   // Tenant-key validation (F2) now lives in the `PrefixedDuckDBProvider`
   // subclass, not in the tenant-free library class — see
   // `test/prefixed-duckdb-provider.test.ts`.
+
+  describe('CQL2 filter (Part 3)', () => {
+    it('actually filters — features are the expected subset AND numberMatched reflects it', async () => {
+      // Threshold chosen so it is neither "everyone" nor "no one": London
+      // (9,002,488) and Tokyo (13,960,000) qualify, Paris (2,161,000) does
+      // not. An assertion on `features.length` alone would not catch a
+      // provider that ignored the filter and returned all three with a
+      // `numberMatched` of 3 — this is the exact shape of the bug being
+      // fixed, so both are asserted.
+      const fc = await provider.getFeatures(fakeReq(db), 'cities', {
+        limit: 10,
+        filter: 'population > 3000000',
+      });
+
+      expect(fc.features.map((f) => f.properties.name).sort()).toEqual(['London', 'Tokyo']);
+      expect(fc.numberMatched).toBe(2);
+      expect(fc.numberReturned).toBe(2);
+    });
+
+    it('combines a filter with a bbox — both predicates apply', async () => {
+      // bbox covers London and Paris only (see the bbox test above); the
+      // filter further narrows to population > 3000000, which excludes
+      // Paris. Only the intersection — London — must come back.
+      const fc = await provider.getFeatures(fakeReq(db), 'cities', {
+        limit: 10,
+        bbox: [-1, 48, 3, 52],
+        filter: 'population > 3000000',
+      });
+
+      expect(fc.features.map((f) => f.properties.name)).toEqual(['London']);
+      expect(fc.numberMatched).toBe(1);
+      expect(fc.numberReturned).toBe(1);
+    });
+
+    it('binds a literal containing a single quote as a parameter, not by string interpolation', async () => {
+      // CQL2-text escapes an embedded quote by doubling it. If the
+      // translated value were ever concatenated into the SQL text instead of
+      // bound as a `?` parameter, this would either break the query or match
+      // the wrong row.
+      const fc = await provider.getFeatures(fakeReq(db), 'people', {
+        limit: 10,
+        filter: "name = 'O''Brien'",
+      });
+
+      expect(fc.features.map((f) => f.properties.name)).toEqual(['O\'Brien']);
+      expect(fc.numberMatched).toBe(1);
+
+      // Record the generated SQL and bound params for one representative
+      // filter, so the parameterisation is on the record.
+      const translator = new Cql2ToSql({ allowedProperties: ['id', 'name'] });
+      const { sql, params } = translator.toSql("name = 'O''Brien'");
+      expect(sql).toBe('"name" = ?');
+      expect(params).toEqual(["O'Brien"]);
+    });
+
+    it('rejects an unknown property as UNKNOWN_PROPERTY, naming it — not a raw DuckDB Binder Error', async () => {
+      let caught: unknown;
+      try {
+        await provider.getFeatures(fakeReq(db), 'cities', { limit: 10, filter: 'secret = 1' });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(Cql2Error);
+      const err = caught as Cql2Error;
+      expect(err.code).toBe('UNKNOWN_PROPERTY');
+      expect(err.detail).toBe('secret');
+    });
+
+    it('rejects a malformed filter as PARSE_ERROR', async () => {
+      let caught: unknown;
+      try {
+        await provider.getFeatures(fakeReq(db), 'cities', { limit: 10, filter: "name = 'unterminated" });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(Cql2Error);
+      expect((caught as Cql2Error).code).toBe('PARSE_ERROR');
+    });
+
+    it('rejects a valid-but-unsupported CQL2 construct as UNSUPPORTED_OP', async () => {
+      // `UPPER(...)` is genuine CQL2 (cql2-rs parses it, and can even
+      // translate it to DuckSQL) but is not in this package's `SUPPORTED_OPS`
+      // allowlist — see the report for why this is flagged as a gap rather
+      // than patched here (src/cql2/ is owned by another agent).
+      let caught: unknown;
+      try {
+        await provider.getFeatures(fakeReq(db), 'cities', {
+          limit: 10,
+          filter: "UPPER(name) = 'LONDON'",
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(Cql2Error);
+      expect((caught as Cql2Error).code).toBe('UNSUPPORTED_OP');
+    });
+
+    it('geometry column is an allowed filter property (spatial predicates can name it)', async () => {
+      // `roads`'s geometry column is `route`, not `geometry` — proving this
+      // is discovery-driven, not a hardcoded allowance for a literal
+      // "geometry" name.
+      const fc = await provider.getFeatures(fakeReq(db), 'roads', {
+        limit: 10,
+        filter: 'S_INTERSECTS(route, POINT(0 0))',
+      });
+
+      expect(fc.features.map((f) => f.properties.name)).toEqual(['Main St']);
+      expect(fc.numberMatched).toBe(1);
+    });
+
+    describe('over real HTTP', () => {
+      function startServer(): { baseUrl: string; close: () => void } {
+        const app = express();
+        app.use((_req, res, next) => {
+          res.locals.db = db;
+          next();
+        });
+        const ogc = new OGCAPI(provider, app, {});
+        app.use(ogc.getRouter());
+        const server = app.listen(0);
+        const baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+        return { baseUrl, close: () => server.close() };
+      }
+
+      it('an unknown property in filter is a 400 over HTTP, with the property name in the body', async () => {
+        const { baseUrl, close } = startServer();
+        try {
+          const res = await fetch(`${baseUrl}/collections/cities/items?filter=${encodeURIComponent('secret = 1')}`);
+          const body = (await res.json()) as { code: string; description: string };
+
+          expect(res.status).toBe(400);
+          expect(body.description).toContain('secret');
+          expect(body.description).toContain('UNKNOWN_PROPERTY');
+        } finally {
+          close();
+        }
+      });
+
+      it('a malformed filter is a 400 over HTTP', async () => {
+        const { baseUrl, close } = startServer();
+        try {
+          const res = await fetch(
+            `${baseUrl}/collections/cities/items?filter=${encodeURIComponent("name = 'unterminated")}`
+          );
+          const body = (await res.json()) as { code: string; description: string };
+
+          expect(res.status).toBe(400);
+          expect(body.description).toContain('PARSE_ERROR');
+        } finally {
+          close();
+        }
+      });
+
+      it('a filter cql2-rs parses leniently into a non-boolean fragment is a 400, not a 500 leaking SQL', async () => {
+        // `cql2-rs` parses `name ===` leniently, discarding the malformed
+        // `==` tail, and returns a bare property reference rather than
+        // throwing — so `Cql2ToSql` never raises a `Cql2Error` here, and the
+        // Cql2Error -> 400 mapping in items-curd.ts never fires. DuckDB then
+        // rejects the resulting `WHERE ("name")` at runtime because a
+        // VARCHAR column isn't a boolean expression. Without the provider's
+        // defensive net, this would 500 with the generated SQL and the
+        // physical table name in the body.
+        const { baseUrl, close } = startServer();
+        try {
+          const res = await fetch(`${baseUrl}/collections/cities/items?filter=${encodeURIComponent('name ===')}`);
+          const body = await res.text();
+
+          expect(res.status).toBe(400);
+          expect(body).not.toContain('SELECT');
+          expect(body).not.toContain('cities');
+          expect(body).toContain('name ===');
+
+          const parsed = JSON.parse(body) as { code: string; description: string };
+          expect(parsed.description).toContain('name ===');
+        } finally {
+          close();
+        }
+      });
+
+      it('a second, differently-shaped lenient-parse filter is also a 400, not a 500', async () => {
+        // A different malformed expression (`EXISTS` used as a bare suffix,
+        // rather than `===`) that `cql2-rs` also parses down to a bare,
+        // non-boolean property reference — proving the defensive net isn't
+        // narrowly matching just the one reported string.
+        const { baseUrl, close } = startServer();
+        try {
+          const res = await fetch(`${baseUrl}/collections/cities/items?filter=${encodeURIComponent('name EXISTS')}`);
+          const body = await res.text();
+
+          expect(res.status).toBe(400);
+          expect(body).not.toContain('SELECT');
+          expect(body).not.toContain('cities');
+        } finally {
+          close();
+        }
+      });
+
+      it('an unfiltered request that fails for a genuine server reason still 500s (guard against over-broad catching)', async () => {
+        // No `filter` at all — a missing-collection Catalog Error here must
+        // NOT be caught by the same defensive net as the filter-shaped
+        // errors above. If the net were scoped on the error's *text*
+        // (matching "Conversion Error"/"Binder Error" generically) rather
+        // than on "a filter was actually applied", this would wrongly turn
+        // into a 400 and nothing would catch that regression.
+        const { baseUrl, close } = startServer();
+        try {
+          const res = await fetch(`${baseUrl}/collections/does_not_exist_at_all/items`);
+          expect(res.status).toBe(500);
+        } finally {
+          close();
+        }
+      });
+
+      it('a valid-but-unsupported CQL2 construct is a 400 over HTTP', async () => {
+        const { baseUrl, close } = startServer();
+        try {
+          const res = await fetch(
+            `${baseUrl}/collections/cities/items?filter=${encodeURIComponent("UPPER(name) = 'LONDON'")}`
+          );
+          const body = (await res.json()) as { code: string; description: string };
+
+          expect(res.status).toBe(400);
+          expect(body.description).toContain('UNSUPPORTED_OP');
+        } finally {
+          close();
+        }
+      });
+
+      it('pagination under a filter: limit/offset produce correct numberMatched and next/prev links', async () => {
+        const { baseUrl, close } = startServer();
+        const filter = encodeURIComponent('population > 3000000');
+        try {
+          // Page 1: London and Tokyo both match; limit 1 offset 0 -> London,
+          // with a `next` link (since 0 + 1 < 2) and no `prev` link.
+          const page1 = await fetch(`${baseUrl}/collections/cities/items?filter=${filter}&limit=1&offset=0`);
+          const body1 = (await page1.json()) as {
+            features: Array<{ properties: { name: string } }>;
+            numberMatched: number;
+            links: Array<{ rel: string; href: string }>;
+          };
+          expect(page1.status).toBe(200);
+          expect(body1.numberMatched).toBe(2);
+          expect(body1.features.map((f) => f.properties.name)).toEqual(['London']);
+          const next = body1.links.find((l) => l.rel === 'next');
+          expect(next).toBeDefined();
+          expect(next?.href).toContain('offset=1');
+          expect(body1.links.find((l) => l.rel === 'prev')).toBeUndefined();
+
+          // Page 2: offset 1 -> Tokyo, with a `prev` link back to offset 0
+          // and no `next` link (since 1 + 1 is not < 2).
+          const page2 = await fetch(`${baseUrl}/collections/cities/items?filter=${filter}&limit=1&offset=1`);
+          const body2 = (await page2.json()) as {
+            features: Array<{ properties: { name: string } }>;
+            numberMatched: number;
+            links: Array<{ rel: string; href: string }>;
+          };
+          expect(page2.status).toBe(200);
+          expect(body2.numberMatched).toBe(2);
+          expect(body2.features.map((f) => f.properties.name)).toEqual(['Tokyo']);
+          expect(body2.links.find((l) => l.rel === 'next')).toBeUndefined();
+          const prev = body2.links.find((l) => l.rel === 'prev');
+          expect(prev).toBeDefined();
+          expect(prev?.href).toContain('offset=0');
+        } finally {
+          close();
+        }
+      });
+    });
+  });
 });

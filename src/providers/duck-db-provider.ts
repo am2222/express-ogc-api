@@ -3,6 +3,8 @@ import type { DuckDBConnection, DuckDBValue, JS } from '@duckdb/node-api';
 // biome-ignore assist/source/organizeImports: <explanation>
 import type {
     Collection,
+    CollectionSchema,
+    CollectionSchemaProperty,
     Feature,
     FeatureCollection,
     ProviderRequest,
@@ -14,6 +16,19 @@ import type { Geometry } from 'geojson';
 import { OGCAPIConformanceItem, OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 import { BaseProvider, type ProviderDef } from '@/providers/base-provider';
 import { FeatureValidationError } from '@/errors';
+import { Cql2ToSql } from '@/cql2';
+
+/** A WHERE clause (empty string when there is nothing to filter by) and the
+ * values bound to its `?` placeholders, in the order they appear. `filter`
+ * carries the original CQL2 `filter` text through to query execution — not
+ * used to build SQL (that already happened in `buildPredicate`), only so a
+ * DuckDB failure while running the query can be scoped to "a filter was
+ * applied" and named back to the client without leaking generated SQL. */
+interface Predicate {
+    where: string;
+    params: DuckDBValue[];
+    filter: string | undefined;
+}
 
 export interface DuckDBLocals {
     db: DuckDBConnection;
@@ -22,6 +37,9 @@ export interface DuckDBLocals {
 export interface DuckDBProviderDef extends ProviderDef {}
 
 type DuckDBRequest = ProviderRequest<Record<string, string>, DuckDBLocals>;
+
+/** Shared empty set for the `timeColumns`/`dateColumns` default parameters — avoids allocating a new one per call that doesn't need it. */
+const EMPTY_SET: ReadonlySet<string> = new Set();
 
 export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBLocals> {
     public override readonly enableSchemas = true;
@@ -133,6 +151,121 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
+     * Every column name on a table — the `allowedProperties` a `Cql2ToSql`
+     * instance needs so an unknown queryable in a `filter` is rejected with a
+     * clean `UNKNOWN_PROPERTY` (→ 400) instead of reaching the database as a
+     * raw identifier and failing as a Binder Error. Includes the geometry
+     * column deliberately: a spatial predicate (`S_INTERSECTS`, `S_WITHIN`,
+     * ...) has to be able to name it.
+     *
+     * A light `information_schema.columns` lookup — the same shape as
+     * `idColumns`/`geometryColumn` above — not a call into `getSchema`:
+     * `getSchema`'s geometry-format discovery runs a full table scan, and
+     * this runs on every `getFeatures`/`getFeatureCount` call, a per-request
+     * path `getSchema` is documented not to be on. `tableName` is a physical
+     * table name (as produced by `physicalTableName`).
+     */
+    private async columnNames(db: DuckDBConnection, tableName: string): Promise<string[]> {
+        const reader = await db.runAndReadAll(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = ?
+            `, [tableName]);
+        return reader.getRowObjectsJS().map((row) => String(row['column_name']));
+    }
+
+    /**
+     * The combined WHERE predicate for `bbox` and CQL2 `filter` — built once
+     * per request and handed to both `getFeatures` and `getFeatureCount` so
+     * they can never disagree. `getFeatureCount` backs `numberMatched`, which
+     * backs the `next`/`prev` pagination links; if it applied a different
+     * predicate than the features query, the reported total (and therefore
+     * pagination) would be wrong on every filtered page.
+     *
+     * The bbox clause's bounds are plain numbers (already parsed and typed by
+     * `bboxXY`/`QueryParams.bbox`), so they're safe to inline the same way the
+     * pre-existing bbox-only code did. The CQL2 filter is translated by
+     * `Cql2ToSql`, which returns `?` placeholders with a parallel bound-values
+     * array — those are appended to `params`, never interpolated into the
+     * SQL text. A `Cql2Error` (`PARSE_ERROR` / `UNSUPPORTED_OP` /
+     * `UNKNOWN_PROPERTY`) from a malformed or disallowed filter propagates
+     * out of this method uncaught; `items-curd.ts` maps it to a 400.
+     *
+     * `tableName` is a physical table name (as produced by `physicalTableName`).
+     */
+    private async buildPredicate(
+        db: DuckDBConnection,
+        tableName: string,
+        geometryColumn: string | undefined,
+        params: QueryParams
+    ): Promise<Predicate> {
+        const clauses: string[] = [];
+        const boundParams: DuckDBValue[] = [];
+
+        const bboxXY = this.bboxXY(params.bbox);
+        if (bboxXY && geometryColumn) {
+            const [minx, miny, maxx, maxy] = bboxXY;
+            clauses.push(
+                `ST_Intersects(${this.quote(geometryColumn)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy}))`
+            );
+        }
+
+        if (params.filter) {
+            const allowedProperties = await this.columnNames(db, tableName);
+            const translator = new Cql2ToSql({ allowedProperties });
+            const { sql, params: filterParams } = translator.toSql(params.filter, params.filterLang);
+            clauses.push(`(${sql})`);
+            boundParams.push(...(filterParams as DuckDBValue[]));
+        }
+
+        return {
+            where: clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '',
+            params: boundParams,
+            filter: params.filter,
+        };
+    }
+
+    /**
+     * A defensive net for a filter `Cql2ToSql` accepts but that still can't
+     * run as a `WHERE` predicate — e.g. `category ===`, which `cql2-rs`
+     * parses leniently (discarding the malformed tail) into a bare,
+     * non-boolean property reference rather than throwing. `Cql2ToSql` never
+     * sees an error in that case, so the `Cql2Error` → 400 mapping in
+     * `items-curd.ts` never fires, and without this the resulting DuckDB
+     * `Conversion Error`/`Binder Error` would 500 with raw SQL and internal
+     * column names in the body.
+     *
+     * Scoped narrowly on purpose:
+     *   - Only fires when `predicateFilter` is set — i.e. a `filter` was
+     *     actually applied to this query. An unfiltered request hitting a
+     *     genuine server fault (missing table, connection failure, anything
+     *     else) must keep its 500 exactly as before; only ever passing this
+     *     the request's own filter text (`params.filter`, not something
+     *     derived from `err`) is what keeps that guarantee intact regardless
+     *     of what the error looks like.
+     *   - Only recognises the two DuckDB error shapes a bad-but-accepted
+     *     filter is known to produce (`Conversion Error`, `Binder Error`).
+     *     Anything else — `Catalog Error`, a connection drop, an internal
+     *     driver fault — is returned unchanged and still 500s.
+     *
+     * The resulting message names the filter the client submitted (that's
+     * exactly what they sent — nothing new is disclosed) but never the
+     * generated SQL or a physical column/table name.
+     */
+    private translateFilterQueryError(err: unknown, predicateFilter: string | undefined): unknown {
+        if (!predicateFilter || !(err instanceof Error)) {
+            return err;
+        }
+        if (err.message.startsWith('Conversion Error:') || err.message.startsWith('Binder Error:')) {
+            return new FeatureValidationError(
+                `The filter could not be applied: ${predicateFilter}`,
+                { status: 400, cause: err }
+            );
+        }
+        return err;
+    }
+
+    /**
      * The geometry column of a table, if any. `broad` widens the match beyond
      * `GEOMETRY` to the specific spatial types too (used for extent discovery,
      * where the column may not literally be typed `GEOMETRY`). `tableName` is a
@@ -159,6 +292,53 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
+     * Which columns of a table are declared `TIME` and which are declared
+     * `DATE` — the two DuckDB temporal types whose default JS/JSON
+     * representation needs correcting before a feature is served (see
+     * `rowToFeature`/`normalizeValue`). Both arrive from `getRowObjectsJS()`
+     * in a form that, taken alone, can't be told apart from a type that
+     * should serialize differently (`TIME` is a bare `bigint`, indistinguishable
+     * by value from a genuine `BIGINT` column; `DATE` is a `Date`,
+     * indistinguishable by value from a `TIMESTAMP`/`TIMESTAMP WITH TIME
+     * ZONE`'s `Date`, which must NOT get the `DATE` treatment). So the
+     * column's declared type has to come from schema metadata, not the value.
+     *
+     * One query covers both `TIME` and `DATE`, rather than two separate
+     * one-type queries, since both are exact-string matches against
+     * `duckdb_columns().data_type` (DuckDB's own rendering of `TIME` and
+     * `DATE` are each a fixed, unambiguous string — no substring-ordering
+     * pitfall here the way there is in `mapDuckDBType`).
+     *
+     * Read via `duckdb_columns()`, not `information_schema.columns` —
+     * `duckdb_columns()` is already the source of truth for `getSchema` (see
+     * there for why). `tableName` is a physical table name (as produced by
+     * `physicalTableName`).
+     */
+    private async temporalColumnKinds(
+        db: DuckDBConnection,
+        tableName: string
+    ): Promise<{ timeColumns: Set<string>; dateColumns: Set<string> }> {
+        const reader = await db.runAndReadAll(`
+            SELECT column_name, data_type
+            FROM duckdb_columns()
+            WHERE database_name = current_database() AND schema_name = current_schema()
+              AND table_name = ? AND data_type IN ('TIME', 'DATE')
+            `, [tableName]);
+
+        const timeColumns = new Set<string>();
+        const dateColumns = new Set<string>();
+        for (const row of reader.getRowObjectsJS()) {
+            const columnName = String(row['column_name']);
+            if (row['data_type'] === 'TIME') {
+                timeColumns.add(columnName);
+            } else {
+                dateColumns.add(columnName);
+            }
+        }
+        return { timeColumns, dateColumns };
+    }
+
+    /**
      * Normalize a 4- or 6-element bbox to its 2D [minx, miny, maxx, maxy] form.
      * A 6-element bbox is `[minx, miny, minz, maxx, maxy, maxz]`; the z bounds
      * aren't used by the 2D spatial filter below, so they're dropped.
@@ -179,16 +359,126 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * columns as JS `bigint`, which `JSON.stringify` (used by `res.json()`)
      * cannot serialize at all — it throws. Normalise: within the safe integer
      * range, a plain `number` round-trips exactly; outside it, a decimal
-     * string is lossy but at least doesn't crash the response. Every other
-     * value passes through unchanged.
+     * string is lossy but at least doesn't crash the response.
+     *
+     * `BLOB` columns arrive as a `Uint8Array` (in practice a Node `Buffer`,
+     * which is a `Uint8Array` subclass), and `JSON.stringify` renders that as
+     * `{"0":65,"1":66,...}` — technically valid JSON, but useless to a
+     * client. Base64 is what `contentEncoding: 'base64'` in `getSchema`
+     * advertises, so that's what every `Uint8Array` value is turned into
+     * here. This check needs no column-type context: the only column that
+     * reaches `rowToFeature`'s `properties` as a raw binary value is a BLOB
+     * column — the geometry column (also WKB/`Uint8Array` at the JS binding
+     * layer) is stripped out of `properties` before normalisation ever sees
+     * it (see `rowToFeature` below).
+     *
+     * `TIME` columns arrive as a `bigint` too — microseconds since
+     * midnight — indistinguishable *by value* from a genuine `BIGINT`
+     * column. `DATE` columns arrive as a `Date`, indistinguishable *by
+     * value* from a `TIMESTAMP`/`TIMESTAMP WITH TIME ZONE`'s `Date` (both are
+     * plain JS `Date` instances; nothing about the object says which SQL type
+     * produced it). Neither ambiguity can be resolved from the value alone,
+     * so the caller must say which kind of column this is (`columnKind`);
+     * everything else — a `bigint` from a non-`TIME` column, a `Date` from a
+     * non-`DATE` column — falls through to the pre-existing handling below
+     * (safe-range BIGINT normalisation, or an unmodified `Date` that
+     * `JSON.stringify` renders as a full ISO instant, which is exactly right
+     * for `TIMESTAMP`/`TIMESTAMP WITH TIME ZONE`).
      */
-    private normalizeValue(value: unknown): unknown {
+    private normalizeValue(value: unknown, columnKind?: 'time' | 'date'): unknown {
+        if (value instanceof Uint8Array) {
+            return Buffer.from(value).toString('base64');
+        }
+        if (columnKind === 'date' && value instanceof Date) {
+            return this.dateToYMD(value);
+        }
         if (typeof value !== 'bigint') {
             return value;
         }
+        if (columnKind === 'time') {
+            return this.microsToTimeString(value);
+        }
+        // Deliberate trade-off, not an oversight: `getSchema` declares this
+        // column `type: 'integer'` (QGIS needs a numeric type to treat the
+        // field as numeric — widening the declared type to
+        // `['integer','string']` to accommodate the rare beyond-2^53 case
+        // would likely confuse QGIS for the common case, in exchange for
+        // correctly describing a rare one). So above `Number.MAX_SAFE_INTEGER`
+        // the *value*'s JSON type is allowed to disagree with the *declared*
+        // schema type: a decimal string, which at least round-trips the exact
+        // digits for a client that reads it as text. The alternatives are
+        // both worse — a `Number` here would silently lose precision, and
+        // returning the raw `bigint` would crash `JSON.stringify` outright.
+        // Do not "fix" this by changing the declared type or by returning a
+        // `Number`; if it needs revisiting, that's a product decision to make
+        // deliberately, not a bug to patch here.
         return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER)
             ? Number(value)
             : value.toString();
+    }
+
+    /**
+     * Format a `DATE` column's JS `Date` value (as produced by
+     * `getRowObjectsJS()`) as an RFC 3339 full-date string (`YYYY-MM-DD`),
+     * matching the `format: 'date'` `getSchema` declares for a `DATE`
+     * column. `JSON.stringify`'s default `Date` -> ISO-instant rendering
+     * (`...T00:00:00.000Z`) is correct for `TIMESTAMP`/`TIMESTAMP WITH TIME
+     * ZONE` (declared `format: 'date-time'`) but wrong here: handing a client
+     * a full timestamp string where the schema promises a bare date is
+     * self-contradictory, and QGIS in particular maps `format: 'date'` to a
+     * date field, so it would be parsing a datetime string into it.
+     *
+     * Uses the UTC getters, not local ones. DuckDB's `DATE` type has no
+     * time-of-day or timezone component, and `@duckdb/node-api` represents it
+     * as a `Date` at UTC midnight (e.g. `1867-05-19T00:00:00.000Z`) — reading
+     * that back with `getFullYear()`/`getMonth()`/`getDate()` (local time) on
+     * a machine west of UTC would see the previous local day and silently
+     * shift every `DATE` value back by one.
+     */
+    private dateToYMD(date: Date): string {
+        const year = date.getUTCFullYear();
+        const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+        const day = String(date.getUTCDate()).padStart(2, '0');
+        return `${String(year).padStart(4, '0')}-${month}-${day}`;
+    }
+
+    /**
+     * Convert DuckDB's `TIME` representation — a `bigint` count of
+     * microseconds since midnight (e.g. `45045000000n` for `12:30:45`) — into
+     * an ISO-8601 time-of-day string (`HH:MM:SS`, with a fractional-seconds
+     * suffix only when the value actually carries one), matching the
+     * `format: 'time'` `getSchema` now advertises for `TIME` columns.
+     *
+     * Defensively wraps a negative or >=24h value into `[0, 86400000000)`
+     * rather than emitting an out-of-range or negative clock string —
+     * DuckDB's own `TIME` type shouldn't produce one, but this keeps the
+     * output well-formed even if it ever does.
+     */
+    private microsToTimeString(micros: bigint): string {
+        const microsPerSecond = 1_000_000n;
+        const microsPerDay = 86_400n * microsPerSecond;
+
+        let normalized = micros % microsPerDay;
+        if (normalized < 0n) {
+            normalized += microsPerDay;
+        }
+
+        const totalSeconds = normalized / microsPerSecond;
+        const fractionMicros = normalized % microsPerSecond;
+
+        const hours = totalSeconds / 3600n;
+        const minutes = (totalSeconds % 3600n) / 60n;
+        const seconds = totalSeconds % 60n;
+
+        const pad2 = (n: bigint) => n.toString().padStart(2, '0');
+        let result = `${pad2(hours)}:${pad2(minutes)}:${pad2(seconds)}`;
+
+        if (fractionMicros !== 0n) {
+            const fraction = fractionMicros.toString().padStart(6, '0').replace(/0+$/, '');
+            result += `.${fraction}`;
+        }
+
+        return result;
     }
 
     /**
@@ -198,11 +488,17 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * geometry ends up serialized into every feature's properties alongside the
      * parsed GeoJSON geometry.
      */
-    private rowToFeature(row: Record<string, JS>, geometryColumn: string | undefined): Feature {
+    private rowToFeature(
+        row: Record<string, JS>,
+        geometryColumn: string | undefined,
+        timeColumns: ReadonlySet<string> = EMPTY_SET,
+        dateColumns: ReadonlySet<string> = EMPTY_SET
+    ): Feature {
         const { __geometry_json, ...rest } = row;
         const properties: Record<string, unknown> = {};
         for (const [column, value] of Object.entries(rest)) {
-            properties[column] = this.normalizeValue(value);
+            const columnKind = timeColumns.has(column) ? 'time' : dateColumns.has(column) ? 'date' : undefined;
+            properties[column] = this.normalizeValue(value, columnKind);
         }
         if (geometryColumn) {
             delete properties[geometryColumn];
@@ -358,39 +654,55 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * every constraint DuckDB already knows about rather than just `{ type }`:
      * `enum` for an `ENUM` column, `required` for non-nullable columns,
      * `maxLength` where DuckDB reports a `character_maximum_length`,
-     * `x-ogc-role` on the discovered geometry column (and, where unambiguous,
-     * the id column) — matching what `InMemoryProvider.getSchema` already
-     * emits for `x-ogc-role: 'primary-geometry'` — plus two keywords QGIS's
-     * OGC API - Features provider actually parses: `x-ogc-propertySeq`
-     * (the column's `ordinal_position`, so QGIS orders attribute-table
-     * fields the way the table declares them) and `title` (a derived field
-     * alias — see `titleFromColumnName`).
+     * `format` for `DATE`/`TIME`/`TIMESTAMP`/`TIMESTAMP WITH TIME
+     * ZONE`/`UUID` columns and for the discovered geometry column (see
+     * `geometryFormat`), `contentEncoding: 'base64'` for a `BLOB` column
+     * (matching how `normalizeValue` now serializes one), `description` from
+     * a DuckDB column comment when one exists, `x-ogc-role` on the
+     * discovered geometry column (and, where unambiguous, the id column) —
+     * matching what `InMemoryProvider.getSchema` already emits for
+     * `x-ogc-role: 'primary-geometry'` — plus two keywords QGIS's OGC API -
+     * Features provider actually parses: `x-ogc-propertySeq` (the column's
+     * ordinal position, so QGIS orders attribute-table fields the way the
+     * table declares them) and `title` (a derived field alias — see
+     * `titleFromColumnName`).
      *
-     * Deliberately not emitted: `description` and `readOnly`. DuckDB has no
-     * column-comment metadata readily available through
-     * `information_schema.columns` here, and no column in a plain DuckDB
-     * table is read-only, so there is nothing truthful to put in either
-     * keyword — inventing values would be fabrication, not metadata.
+     * Column metadata comes from `duckdb_columns()`, not
+     * `information_schema.columns`: the latter has no `comment` column at
+     * all, and `duckdb_columns()` already carries everything the old query
+     * did (`column_name`, `data_type`, `is_nullable`, ordinal position as
+     * `column_index`, and `character_maximum_length`), so one query replaces
+     * what used to need a join.
+     *
+     * Deliberately not emitted: `readOnly`. No column in a plain DuckDB
+     * table is read-only, so there is nothing truthful to put there —
+     * inventing a value would be fabrication, not metadata.
+     *
+     * This adds one extra query beyond the previous version — `geometryFormat`'s
+     * `SELECT DISTINCT ST_GeometryType(...)` scan of the geometry column,
+     * run only when the table has one. Acceptable here: `/schema` is not a
+     * hot path the way `/items` is, and this never runs per-feature.
      *
      * This is advisory metadata for clients, not enforcement: the provider
      * does not validate a request body against this schema before writing.
      * Enforcement is left to the database, whose rejections the write paths
      * below translate into `FeatureValidationError`.
      */
-    async getSchema(req: DuckDBRequest, collectionId: string): Promise<Record<string, unknown>> {
+    async getSchema(req: DuckDBRequest, collectionId: string): Promise<CollectionSchema> {
         const db = this.conn(req);
         const tableName = this.physicalTableName(req, collectionId);
 
         const columns = await db.runAndReadAll(`
-      SELECT column_name, data_type, is_nullable, character_maximum_length, ordinal_position
-      FROM information_schema.columns
-      WHERE table_schema = current_schema() AND table_name = ?
+      SELECT column_name, data_type, is_nullable, character_maximum_length, column_index, comment
+      FROM duckdb_columns()
+      WHERE database_name = current_database() AND schema_name = current_schema() AND table_name = ?
     `, [tableName]);
 
         // Reuse the same discovery the read/write paths use, rather than
         // assuming the column is literally named 'geometry' — the two bundled
         // providers must agree on which column is "the" geometry column.
         const geometryColumn = await this.geometryColumn(db, tableName);
+        const geometryFormat = geometryColumn ? await this.geometryFormat(db, tableName, geometryColumn) : undefined;
 
         // Mark an id column only when discovery is unambiguous: 'id' and 'fid'
         // are both conventional identifier names, and `idColumns` can return
@@ -400,7 +712,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const idCols = await this.idColumns(db, tableName);
         const idColumn = idCols.length === 1 ? idCols[0] : undefined;
 
-        const properties: Record<string, any> = {};
+        const properties: Record<string, CollectionSchemaProperty> = {};
         const required: string[] = [];
 
         const cols = columns.getRowObjectsJS();
@@ -408,13 +720,18 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             const columnName = String(col['column_name']);
             const dataType = String(col['data_type']);
 
-            const property: Record<string, unknown> = {};
+            const property: CollectionSchemaProperty = {};
 
             property.title = this.titleFromColumnName(columnName);
 
-            const ordinalPosition = col['ordinal_position'];
+            const ordinalPosition = col['column_index'];
             if (ordinalPosition !== null && ordinalPosition !== undefined) {
                 property['x-ogc-propertySeq'] = Number(ordinalPosition);
+            }
+
+            const comment = col['comment'];
+            if (typeof comment === 'string' && comment.length > 0) {
+                property.description = comment;
             }
 
             const enumValues = this.parseEnumValues(dataType);
@@ -422,7 +739,11 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
                 property.type = 'string';
                 property.enum = enumValues;
             } else {
-                property.type = this.mapDuckDBTypeToJSON(dataType);
+                Object.assign(property, this.mapDuckDBType(dataType));
+            }
+
+            if (dataType.trim().toUpperCase() === 'BLOB') {
+                property.contentEncoding = 'base64';
             }
 
             const maxLength = col['character_maximum_length'];
@@ -435,13 +756,20 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
             if (geometryColumn && columnName === geometryColumn) {
                 property['x-ogc-role'] = 'primary-geometry';
+                // Overrides whatever `mapDuckDBType` derived from the raw
+                // DuckDB type name (e.g. `object` for `GEOMETRY`) with the
+                // Part 5 geometry-subtype format QGIS uses to determine the
+                // layer's geometry type without sampling features.
+                property.format = geometryFormat;
             } else if (idColumn && columnName === idColumn) {
                 property['x-ogc-role'] = 'id';
             }
 
             properties[columnName] = property;
 
-            if (String(col['is_nullable']).toUpperCase() === 'NO') {
+            // `duckdb_columns().is_nullable` is a real boolean (unlike
+            // `information_schema.columns`, which renders 'YES'/'NO' strings).
+            if (col['is_nullable'] === false) {
                 required.push(columnName);
             }
         }
@@ -452,6 +780,45 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             properties,
             required,
         };
+    }
+
+    /**
+     * The Part 5 geometry `format` for the discovered geometry column:
+     * `geometry-<type>` (e.g. `geometry-point`) when every non-null value in
+     * the column shares exactly one `ST_GeometryType`, or `geometry-any` —
+     * matching `InMemoryProvider`'s existing fallback — when the column is
+     * empty, all-null, mixes more than one geometry type, or reports a type
+     * this method doesn't recognise.
+     *
+     * Costs one `SELECT DISTINCT ST_GeometryType(...) FROM ... WHERE ... IS
+     * NOT NULL` scan of the table per `getSchema` call — a full scan, not an
+     * indexed lookup, so it scales with table size. That's acceptable for
+     * `/schema`, which is not a hot path, but this must never be called from
+     * a per-feature code path (`getFeatures`/`getFeature`).
+     */
+    private async geometryFormat(db: DuckDBConnection, tableName: string, geometryColumn: string): Promise<string> {
+        const quotedCol = this.quote(geometryColumn);
+        const reader = await db.runAndReadAll(`
+            SELECT DISTINCT ST_GeometryType(${quotedCol}) AS geom_type
+            FROM ${this.quote(tableName)}
+            WHERE ${quotedCol} IS NOT NULL
+            `);
+        const rows = reader.getRowObjectsJS();
+        if (rows.length !== 1) {
+            return 'geometry-any';
+        }
+
+        const geomType = String(rows[0]!['geom_type']).toUpperCase();
+        const knownTypes = new Set([
+            'POINT',
+            'LINESTRING',
+            'POLYGON',
+            'MULTIPOINT',
+            'MULTILINESTRING',
+            'MULTIPOLYGON',
+            'GEOMETRYCOLLECTION',
+        ]);
+        return knownTypes.has(geomType) ? `geometry-${geomType.toLowerCase()}` : 'geometry-any';
     }
 
     /**
@@ -516,25 +883,66 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         return values;
     }
 
-    private mapDuckDBTypeToJSON(duckdbType: string): string {
-        const type = duckdbType.toUpperCase();
-        // Spatial types are checked first: `POINT`, `POLYGON` and
-        // `LINESTRING` all contain the substring `INT`/`POLY`-adjacent
-        // characters that must not fall into the numeric branch below (a
-        // `POINT` column was previously reported as `integer`, since
-        // `'POINT'.includes('INT')` is true).
+    /**
+     * Map a DuckDB `data_type` string to a JSON Schema `{ type, format }`
+     * pair. Ordered deliberately, most-specific first, and matched by exact
+     * string equality rather than substring for every type that has a fixed,
+     * known rendering (`TIMESTAMP WITH TIME ZONE`, `TIMESTAMP`, `DATE`,
+     * `TIME`, `UUID`, `BLOB`):
+     *
+     * `TIMESTAMP WITH TIME ZONE` *contains* the substring `TIME`, and even
+     * plain `TIMESTAMP` starts with `"TIME"` + `"STAMP"` — so a naive
+     * `includes('TIME')`/`startsWith('TIME')` check, if it ran before (or
+     * instead of) an exact `TIMESTAMP` check, would misclassify every
+     * timestamp column as a bare time-of-day. Checking the two `TIMESTAMP`
+     * variants first and returning immediately closes that off: by the time
+     * a `TIME` comparison is reached below, every string starting with
+     * `"TIME"` other than the literal 4-character value `"TIME"` itself has
+     * already matched and returned.
+     *
+     * The substring checks below (`GEOMETRY`/`POINT`/`POLYGON`/`LINESTRING`,
+     * then `INT`) are the pre-existing ones, kept for every DuckDB type this
+     * function doesn't otherwise recognise by exact name — including the
+     * same `POINT`/`INT` collision this method already guarded against
+     * (`'POINT'.includes('INT')` is true, so the spatial check must run
+     * first).
+     */
+    private mapDuckDBType(duckdbType: string): CollectionSchemaProperty {
+        const type = duckdbType.trim().toUpperCase();
+
+        if (type === 'TIMESTAMP WITH TIME ZONE' || type === 'TIMESTAMPTZ') {
+            return { type: 'string', format: 'date-time' };
+        }
+        if (type === 'TIMESTAMP') {
+            return { type: 'string', format: 'date-time' };
+        }
+        if (type === 'DATE') {
+            return { type: 'string', format: 'date' };
+        }
+        if (type === 'TIME') {
+            return { type: 'string', format: 'time' };
+        }
+        if (type === 'UUID') {
+            return { type: 'string', format: 'uuid' };
+        }
+        if (type === 'BLOB') {
+            // `contentEncoding: 'base64'` is added by the caller, which also
+            // knows the column is the one BLOB gets special-cased for.
+            return { type: 'string' };
+        }
+
         if (
             type.includes('GEOMETRY') ||
             type.includes('POINT') ||
             type.includes('POLYGON') ||
             type.includes('LINESTRING')
         ) {
-            return 'object';
+            return { type: 'object' };
         }
-        if (type.includes('INT')) return 'integer';
-        if (type.includes('DOUBLE') || type.includes('FLOAT') || type.includes('DECIMAL')) return 'number';
-        if (type.includes('BOOL')) return 'boolean';
-        return 'string';
+        if (type.includes('INT')) return { type: 'integer' };
+        if (type.includes('DOUBLE') || type.includes('FLOAT') || type.includes('DECIMAL')) return { type: 'number' };
+        if (type.includes('BOOL')) return { type: 'boolean' };
+        return { type: 'string' };
     }
 
     async getFeatures(
@@ -549,6 +957,12 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const offset = params.offset || 0;
 
         const geometryColumn = await this.geometryColumn(db, tableName);
+        const { timeColumns, dateColumns } = await this.temporalColumnKinds(db, tableName);
+
+        // Built once and handed to both this query and `getFeatureCount`, so
+        // the features returned and the total reported (`numberMatched`, which
+        // drives `next`/`prev` pagination) can never apply different filters.
+        const predicate = await this.buildPredicate(db, tableName, geometryColumn, params);
 
         let query = `SELECT *, `;
 
@@ -557,47 +971,46 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         }
 
         query += `FROM ${this.quote(tableName)} `;
+        query += `${predicate.where} LIMIT ${limit} OFFSET ${offset}`;
 
-        // Add bbox filter if provided
-        const bboxXY = this.bboxXY(params.bbox);
-        if (bboxXY && geometryColumn) {
-            const [minx, miny, maxx, maxy] = bboxXY;
-            query += `WHERE ST_Intersects(${this.quote(geometryColumn)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy})) `;
+        let rows;
+        try {
+            rows = await db.runAndReadAll(query, predicate.params);
+        } catch (err) {
+            throw this.translateFilterQueryError(err, predicate.filter);
         }
 
-        query += `LIMIT ${limit} OFFSET ${offset}`;
-
-        const rows = await db.runAndReadAll(query);
-
-        const features: Feature[] = rows.getRowObjectsJS().map((row) => this.rowToFeature(row, geometryColumn));
+        const features: Feature[] = rows
+            .getRowObjectsJS()
+            .map((row) => this.rowToFeature(row, geometryColumn, timeColumns, dateColumns));
 
         return {
             type: 'FeatureCollection',
             features,
-            numberMatched: await this.getFeatureCount(db, tableName, params),
+            numberMatched: await this.getFeatureCount(db, tableName, predicate),
             numberReturned: features.length,
         };
     }
 
-    /** `tableName` is a physical table name (as produced by `physicalTableName`). */
+    /**
+     * Backs `numberMatched`. Takes the *same* `Predicate` `getFeatures` just
+     * built and queried with — not a re-derivation from `params` — so this
+     * can never drift out of sync with what the features query actually
+     * matched. `tableName` is a physical table name (as produced by
+     * `physicalTableName`).
+     */
     private async getFeatureCount(
         db: DuckDBConnection,
         tableName: string,
-        params: QueryParams
+        predicate: Predicate
     ): Promise<number> {
-        let query = `SELECT COUNT(*) as count FROM ${this.quote(tableName)}`;
-
-        const bboxXY = this.bboxXY(params.bbox);
-        if (bboxXY) {
-            const geometryColumn = await this.geometryColumn(db, tableName);
-
-            if (geometryColumn) {
-                const [minx, miny, maxx, maxy] = bboxXY;
-                query += ` WHERE ST_Intersects(${this.quote(geometryColumn)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy}))`;
-            }
+        const query = `SELECT COUNT(*) as count FROM ${this.quote(tableName)} ${predicate.where}`;
+        let reader;
+        try {
+            reader = await db.runAndReadAll(query, predicate.params);
+        } catch (err) {
+            throw this.translateFilterQueryError(err, predicate.filter);
         }
-
-        const reader = await db.runAndReadAll(query);
         return Number(reader.getRowObjectsJS()[0]?.count ?? 0);
     }
 
@@ -610,6 +1023,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const tableName = this.physicalTableName(req, collectionId);
 
         const geometryColumn = await this.geometryColumn(db, tableName);
+        const { timeColumns, dateColumns } = await this.temporalColumnKinds(db, tableName);
 
         let query = `SELECT *, `;
 
@@ -627,7 +1041,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             return null;
         }
 
-        return this.rowToFeature(row, geometryColumn);
+        return this.rowToFeature(row, geometryColumn, timeColumns, dateColumns);
     }
 
     async getQueryables(req: DuckDBRequest, collectionId: string): Promise<Queryable> {
@@ -636,7 +1050,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         return {
             type: 'object',
             title: `Queryables for ${collectionId}`,
-            properties: schema.properties as Record<string, any>,
+            properties: (schema.properties ?? {}) as Record<string, any>,
             $id: `/collections/${collectionId}/queryables`,
             $schema: 'https://json-schema.org/draft/2019-09/schema',
         };

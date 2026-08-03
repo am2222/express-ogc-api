@@ -1,6 +1,7 @@
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 import { FeatureValidationError } from '@/errors';
+import { Cql2Error } from '@/cql2';
 
 import type { FeatureCollection, Link, ProviderRequest, QueryParams } from '@/types';
 import type { NextFunction, Request, Response, Router } from 'express';
@@ -107,6 +108,41 @@ export class ItemsCURDHandler extends BaseHandler {
     next(err);
   }
 
+  /**
+   * Wrap a `Cql2Error` — thrown by `Cql2ToSql`/a provider's `getFeatures`
+   * when a `filter` query parameter is malformed (`PARSE_ERROR`), uses an
+   * operation the translator doesn't support (`UNSUPPORTED_OP`), or names a
+   * property outside the collection's queryables (`UNKNOWN_PROPERTY`) — into
+   * a `FeatureValidationError`. The CQL2 module's own contract is that all
+   * three codes are the client's fault and map to 400; anything else
+   * escaping the translator is a bug and must keep 500ing.
+   *
+   * The `code` and the translator's `detail` (typically the offending
+   * property or operation name) are folded into the message: the entire
+   * point of responding 400 here is that the client can tell what was wrong
+   * with the filter, not just that something was.
+   */
+  private wrapCql2Error(err: Cql2Error): FeatureValidationError {
+    const detail = err.detail ? `: ${err.detail}` : '';
+    return new FeatureValidationError(`Invalid filter (${err.code})${detail} — ${err.message}`, {
+      property: err.code === 'UNKNOWN_PROPERTY' ? err.detail : undefined,
+      status: 400,
+      cause: err,
+    });
+  }
+
+  /**
+   * Shared catch handling for the read endpoints (`handleFeatures`,
+   * `handleFeature`). Before this, a `Cql2Error` from a bad `filter` fell
+   * through to `next(err)` and 500ed — the read-path equivalent of the bug
+   * `handleWriteError` already closed for the write endpoints. A
+   * `Cql2Error` is translated to a `FeatureValidationError` and handled the
+   * same way; anything else still goes to `next(err)` unchanged.
+   */
+  private handleReadError(res: Response, next: NextFunction, err: unknown): void {
+    this.handleWriteError(res, next, err instanceof Cql2Error ? this.wrapCql2Error(err) : err);
+  }
+
   private async handleFeatures(
     req: Request,
     res: Response,
@@ -190,7 +226,7 @@ export class ItemsCURDHandler extends BaseHandler {
       // served as application/geo+json, and clients content-negotiate on it.
       res.type('application/geo+json').json(response);
     } catch (err) {
-      next(err);
+      this.handleReadError(res, next, err);
     }
   }
 
@@ -224,7 +260,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.type('application/geo+json').json(feature);
     } catch (err) {
-      next(err);
+      this.handleReadError(res, next, err);
     }
   }
 

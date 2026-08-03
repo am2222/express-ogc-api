@@ -2,6 +2,7 @@
 // biome-ignore assist/source/organizeImports: <explanation>
 import type {
   Collection,
+  CollectionSchema,
   Feature,
   FeatureCollection,
   FunctionMetadata,
@@ -13,9 +14,21 @@ import type {
 import BaseProvider from './base-provider';
 import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
+import { FeatureValidationError } from '@/errors';
 
 // Example implementation with extended features
 export class InMemoryProvider extends BaseProvider {
+  // Capability flags are now declared explicitly rather than inferred from
+  // which abstract methods a subclass overrides (see "Migrating" in the
+  // README). This provider genuinely implements all three:
+  // `getSchema` infers a real JSON Schema from a sample feature,
+  // `getFeatures`/`getQueryables` support bbox + a basic CQL2 filter, and
+  // `createFeature`/`replaceFeature`/`updateFeature`/`deleteFeature` are all
+  // functional below.
+  public override readonly enableSchemas = true;
+  public override readonly enableFiltering = true;
+  public override readonly enableTransactions = true;
+
   private collections: Map<string, Collection>;
   private features: Map<string, Map<string, Feature>>;
 
@@ -62,7 +75,7 @@ export class InMemoryProvider extends BaseProvider {
   async getSchema(
     req: ProviderRequest,
     collectionId: string
-  ): Promise<Record<string, unknown>> {
+  ): Promise<CollectionSchema> {
     const collection = await this.getCollection(req, collectionId);
 
     if (!collection) {
@@ -179,9 +192,17 @@ export class InMemoryProvider extends BaseProvider {
       });
     }
 
-    // Part 3: Apply CQL2 filter (basic implementation)
-    if (params.filter && params.filterLang) {
-      features = this.applyFilter(features, params.filter, params.filterLang);
+    // Part 3: Apply CQL2 filter (basic implementation).
+    //
+    // Previously gated on `params.filterLang` too, which meant a caller that
+    // set `filter` without also setting `filterLang` (the query-param
+    // handler always sets both, defaulting `filterLang` to 'cql2-text', but
+    // a direct `getFeatures` caller need not) had its filter silently
+    // skipped entirely — the same unfiltered-200 shape this fix closes
+    // elsewhere. `filterLang` isn't actually used by `applyFilter` below, so
+    // there's nothing lost by not requiring it here.
+    if (params.filter) {
+      features = this.applyFilter(features, params.filter, params.filterLang ?? 'cql2-text');
     }
 
     // Part 8: Apply sorting
@@ -338,49 +359,68 @@ export class InMemoryProvider extends BaseProvider {
   }
 
   // Helper methods for filtering and sorting
+
+  /**
+   * A minimal, regex-based CQL2 evaluator for this in-memory reference
+   * provider — not a real CQL2 parser. It honours exactly two shapes, each
+   * matched against the *entire* filter string: a quoted-string equality
+   * (`name = 'value'`) and a numeric comparison (`population > 1000000`).
+   *
+   * `Cql2ToSql` (see `src/cql2/`) is not used here: it emits SQL, and this
+   * provider has no SQL engine to run it against — a real in-memory CQL2
+   * evaluator is a separate, larger piece of work than this fix.
+   *
+   * Anything this cannot confidently evaluate — an expression the regexes
+   * don't match, or one that only partially matches — throws
+   * `FeatureValidationError` (→ 400) rather than falling through to
+   * `return features` unfiltered. A filter is very often an access
+   * restriction; silently ignoring one and returning every feature with a
+   * 200 is the over-exposure this whole fix exists to close, and this
+   * provider must not reproduce it just because its evaluator is small.
+   */
   private applyFilter(
     features: Feature[],
     filter: string,
     _filterLang: string
   ): Feature[] {
-    // Basic CQL2 filter implementation
-    // In production, use a proper CQL2 parser
-    try {
-      // Simple property equality example: name = 'value'
-      const equalityMatch = filter.match(/(\w+)\s*=\s*'([^']+)'/);
-      if (equalityMatch) {
-        const [, prop, value] = equalityMatch;
-        return features.filter((f) => f.properties[prop] === value);
-      }
+    const trimmed = filter.trim();
 
-      // Simple comparison: population > 1000000
-      const comparisonMatch = filter.match(/(\w+)\s*([><=]+)\s*(\d+)/);
-      if (comparisonMatch) {
-        const [, prop, op, value] = comparisonMatch;
-        const numValue = parseFloat(value);
-        return features.filter((f) => {
-          const propValue = f.properties[prop];
-          if (typeof propValue !== 'number') return false;
-          switch (op) {
-            case '>':
-              return propValue > numValue;
-            case '<':
-              return propValue < numValue;
-            case '>=':
-              return propValue >= numValue;
-            case '<=':
-              return propValue <= numValue;
-            case '=':
-              return propValue === numValue;
-            default:
-              return false;
-          }
-        });
-      }
-    } catch (e) {
-      console.error('Filter parsing error:', e);
+    // Simple property equality example: name = 'value'
+    const equalityMatch = /^(\w+)\s*=\s*'([^']*)'$/.exec(trimmed);
+    if (equalityMatch) {
+      const [, prop, value] = equalityMatch;
+      return features.filter((f) => f.properties[prop as string] === value);
     }
-    return features;
+
+    // Simple comparison: population > 1000000
+    const comparisonMatch = /^(\w+)\s*(>=|<=|>|<|=)\s*(\d+(?:\.\d+)?)$/.exec(trimmed);
+    if (comparisonMatch) {
+      const [, prop, op, value] = comparisonMatch;
+      const numValue = parseFloat(value as string);
+      return features.filter((f) => {
+        const propValue = f.properties[prop as string];
+        if (typeof propValue !== 'number') return false;
+        switch (op) {
+          case '>':
+            return propValue > numValue;
+          case '<':
+            return propValue < numValue;
+          case '>=':
+            return propValue >= numValue;
+          case '<=':
+            return propValue <= numValue;
+          case '=':
+            return propValue === numValue;
+          default:
+            return false;
+        }
+      });
+    }
+
+    throw new FeatureValidationError(
+      `InMemoryProvider cannot evaluate this filter expression: ${filter}`,
+      { status: 400 }
+    );
   }
 
   private applySorting(features: Feature[], sortby: string): Feature[] {

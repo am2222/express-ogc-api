@@ -195,4 +195,55 @@ describe('OGC API LandingPage', () => {
 
     expect(response.status).toBe(404);
   });
+
+  describe('InMemoryProvider CQL2 filter — fail loud, not unfiltered (Part 3)', () => {
+    it('an expression the regex evaluator genuinely handles still filters correctly', async () => {
+      // population > 5000000 matches NYC (8,336,817), London (9,002,488) and
+      // Tokyo (13,960,000); SF (883,305) and Paris (2,161,000) do not. Both
+      // `features` and `numberMatched` are checked — a stub that ignored the
+      // filter but still counted every feature would pass a
+      // features-length-only assertion.
+      const response = await fetch(
+        `${baseUrl}/ogc/collections/cities/items?${new URLSearchParams({ filter: 'population > 5000000' })}`
+      );
+      const body = (await response.json()) as {
+        features: Array<{ properties: { name: string } }>;
+        numberMatched: number;
+      };
+
+      expect(response.status).toBe(200);
+      expect(body.features.map((f) => f.properties.name).sort()).toEqual([
+        'London',
+        'New York City',
+        'Tokyo',
+      ]);
+      expect(body.numberMatched).toBe(3);
+    });
+
+    it('an expression the regex evaluator cannot handle is a 400, not silently unfiltered results', async () => {
+      // A compound expression — neither regex matches the whole string.
+      // Before this fix, InMemoryProvider.applyFilter fell through to
+      // `return features`: all 5 cities, unfiltered, with a 200. Now it must
+      // reject instead of silently over-returning.
+      const response = await fetch(
+        `${baseUrl}/ogc/collections/cities/items?${new URLSearchParams({
+          filter: "population > 1000000 AND country = 'USA'",
+        })}`
+      );
+      const body = (await response.json()) as { code: string; description: string };
+
+      expect(response.status).toBe(400);
+      // Not a 200 with all 5 cities back.
+      expect(response.status).not.toBe(200);
+      expect(body.description).toContain('cannot evaluate');
+    });
+
+    it('an unparseable filter is also a 400, not a console.error-and-unfiltered fallback', async () => {
+      const response = await fetch(
+        `${baseUrl}/ogc/collections/cities/items?${new URLSearchParams({ filter: '!!!not cql2 at all!!!' })}`
+      );
+
+      expect(response.status).toBe(400);
+    });
+  });
 });

@@ -1,6 +1,6 @@
 import { InMemoryProvider } from '../../src/index.js';
 import type { ProviderRequest } from '../../src/index.js';
-import type { Collection, Feature, FeatureCollection, QueryParams } from '../../src/types/index.js';
+import type { Collection, CollectionSchema, Feature, FeatureCollection, QueryParams } from '../../src/types/index.js';
 
 export interface RecordedCall {
   method: string;
@@ -61,7 +61,7 @@ export class RecordingProvider extends InMemoryProvider {
   override async getSchema(
     req: ProviderRequest,
     collectionId: string
-  ): Promise<Record<string, unknown>> {
+  ): Promise<CollectionSchema> {
     this.record('getSchema', req);
     return super.getSchema(req, collectionId);
   }

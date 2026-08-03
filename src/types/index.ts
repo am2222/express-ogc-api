@@ -141,6 +141,44 @@ export interface Queryable extends JSONSchema7 {
   $schema: string;
 }
 
+/**
+ * The schema of one property within a `CollectionSchema` (Part 5). Covers the
+ * keywords the two bundled providers actually emit — plain JSON Schema
+ * keywords (`type`, `format`, `title`, `enum`, `maxLength`, `contentEncoding`,
+ * `description`) plus the two `x-ogc-*` extensions QGIS's OGC API - Features
+ * provider parses (`x-ogc-role`, `x-ogc-propertySeq`). The index signature
+ * keeps this open to any other JSON Schema keyword a provider wants to add,
+ * since JSON Schema itself is not a closed vocabulary.
+ */
+export interface CollectionSchemaProperty {
+  type?: string;
+  format?: string;
+  title?: string;
+  description?: string;
+  enum?: unknown[];
+  maxLength?: number;
+  contentEncoding?: string;
+  'x-ogc-role'?: string;
+  'x-ogc-propertySeq'?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * The schema a provider's `getSchema` returns (Part 5 "Schemas" resource): a
+ * JSON Schema object describing a collection's item properties. Named
+ * keywords are typed for the ones this library actually populates; the index
+ * signature leaves room for `$id`, vendor extensions, or anything else a
+ * provider wants to add, since JSON Schema is intentionally open — this type
+ * constrains and documents the shape without trying to close it off.
+ */
+export interface CollectionSchema {
+  $schema?: string;
+  type?: string;
+  properties?: Record<string, CollectionSchemaProperty>;
+  required?: string[];
+  [key: string]: unknown;
+}
+
 export interface FunctionMetadata {
   name: string;
   description?: string;
