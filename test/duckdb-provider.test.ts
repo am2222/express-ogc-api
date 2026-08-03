@@ -6,15 +6,14 @@ import type { ProviderRequest } from '../src/index.js';
 import type { DuckDBLocals } from '../src/index.js';
 
 /**
- * Minimal stand-in for the request. The provider reads only `req.res.locals.db`
- * (and, for tenant-prefixed tables, `req.res.locals.key`) — exactly what
- * application middleware is expected to set.
+ * Minimal stand-in for the request. `DuckDBProvider` itself is tenant-free:
+ * it reads only `req.res.locals.db` — exactly what application middleware
+ * is expected to set. (Tenant-prefix handling lives in the
+ * `examples/prefixed-duckdb-provider.ts` subclass, covered separately in
+ * `test/prefixed-duckdb-provider.test.ts`.)
  */
-function fakeReq(
-  db: DuckDBConnection,
-  key?: string
-): ProviderRequest<Record<string, string>, DuckDBLocals> {
-  const res = { locals: key ? { db, key } : { db } };
+function fakeReq(db: DuckDBConnection): ProviderRequest<Record<string, string>, DuckDBLocals> {
+  const res = { locals: { db } };
   return { params: {}, query: {}, baseUrl: '', res } as unknown as ProviderRequest<
     Record<string, string>,
     DuckDBLocals
@@ -219,7 +218,7 @@ describe('DuckDBProvider', () => {
     expect(replaced?.properties).toEqual(before?.properties);
   });
 
-  it('scopes discovery and reads to <key>_<collection> tables for a tenant', async () => {
+  it('lists every table in the schema as a collection, unprefixed, with no filtering', async () => {
     await db.run(`
       CREATE TABLE db1_cities (id INTEGER, name VARCHAR);
       INSERT INTO db1_cities VALUES (1, 'Tenant One City');
@@ -227,23 +226,21 @@ describe('DuckDBProvider', () => {
       INSERT INTO db2_parks VALUES (1, 'Tenant Two Park');
     `);
 
-    const tenant1 = (await provider.getCollections(fakeReq(db, 'db1'))).map((c) => c.id);
-    expect(tenant1).toEqual(['cities']);
-    expect(tenant1).not.toContain('parks');
+    // The tenant-free library class does no prefix filtering at all: table
+    // names *are* collection ids, verbatim, whatever they happen to be
+    // named. (Prefix-based scoping/hiding is what the
+    // `examples/prefixed-duckdb-provider.ts` subclass adds back in — see
+    // `test/prefixed-duckdb-provider.test.ts`.)
+    const ids = (await provider.getCollections(fakeReq(db))).map((c) => c.id);
+    expect(ids).toContain('cities');
+    expect(ids).toContain('db1_cities');
+    expect(ids).toContain('db2_parks');
 
-    const tenant2 = (await provider.getCollections(fakeReq(db, 'db2'))).map((c) => c.id);
-    expect(tenant2).toEqual(['parks']);
-    expect(tenant2).not.toContain('cities');
-
-    // Reads go through the same prefix: tenant1 can read its own 'cities' by
-    // the bare collection id, and gets the tenant-scoped table, not the
-    // top-level unprefixed 'cities' table used by the rest of this suite.
-    const feature = await provider.getFeature(fakeReq(db, 'db1'), 'cities', '1');
+    // Reads use the collection id as the table name directly, no mapping.
+    const feature = await provider.getFeature(fakeReq(db), 'db1_cities', '1');
     expect(feature?.properties.name).toBe('Tenant One City');
 
-    // A tenant cannot reach the other tenant's table under its own collection id.
-    expect(await provider.getCollection(fakeReq(db, 'db1'), 'parks')).toBeNull();
-    expect(await provider.getCollection(fakeReq(db, 'db2'), 'cities')).toBeNull();
+    expect(await provider.getCollection(fakeReq(db), 'db2_parks')).not.toBeNull();
   });
 
   it('memoizes collection discovery for the life of one request', async () => {
@@ -326,41 +323,7 @@ describe('DuckDBProvider', () => {
     expect(() => JSON.stringify(single)).not.toThrow();
   });
 
-  it('throws when res.locals.key is an empty string, instead of failing open to full-catalog access (F2)', async () => {
-    const req = {
-      params: {},
-      query: {},
-      baseUrl: '',
-      res: { locals: { db, key: '' } },
-    } as unknown as ProviderRequest<Record<string, string>, DuckDBLocals>;
-
-    await expect(provider.getCollections(req)).rejects.toThrow(/res\.locals\.key/);
-  });
-
-  it('throws when res.locals.key contains an underscore (F2)', async () => {
-    const req = {
-      params: {},
-      query: {},
-      baseUrl: '',
-      res: { locals: { db, key: 'acme_eu' } },
-    } as unknown as ProviderRequest<Record<string, string>, DuckDBLocals>;
-
-    await expect(provider.getCollections(req)).rejects.toThrow(/res\.locals\.key/);
-  });
-
-  it('throws when res.locals.key contains other punctuation (F2)', async () => {
-    const req = {
-      params: {},
-      query: {},
-      baseUrl: '',
-      res: { locals: { db, key: 'ac-me' } },
-    } as unknown as ProviderRequest<Record<string, string>, DuckDBLocals>;
-
-    await expect(provider.getCollections(req)).rejects.toThrow(/res\.locals\.key/);
-  });
-
-  it('treats an absent key as flat, single-tenant mode — still works, not an error (F2)', async () => {
-    const collections = await provider.getCollections(fakeReq(db));
-    expect(collections.map((c) => c.id)).toContain('cities');
-  });
+  // Tenant-key validation (F2) now lives in the `PrefixedDuckDBProvider`
+  // subclass, not in the tenant-free library class — see
+  // `test/prefixed-duckdb-provider.test.ts`.
 });

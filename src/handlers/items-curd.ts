@@ -169,7 +169,9 @@ export class ItemsCURDHandler extends BaseHandler {
         timeStamp: new Date().toISOString(),
       };
 
-      res.json(response);
+      // OGC API - Features Core requires GeoJSON feature responses to be
+      // served as application/geo+json, and clients content-negotiate on it.
+      res.type('application/geo+json').json(response);
     } catch (err) {
       next(err);
     }
@@ -203,7 +205,7 @@ export class ItemsCURDHandler extends BaseHandler {
         return;
       }
 
-      res.json(feature);
+      res.type('application/geo+json').json(feature);
     } catch (err) {
       next(err);
     }

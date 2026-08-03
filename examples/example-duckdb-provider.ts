@@ -1,7 +1,11 @@
 
 import express from 'express';
-import { OGCAPI, DuckDBProvider } from '../src/index.ts';
+import { OGCAPI } from '../src/index.ts';
 import duckdb, { DuckDBInstance, DuckDBConnection } from '@duckdb/node-api';
+// Tenant-prefix handling is not built into `DuckDBProvider` — it's a
+// copyable pattern in `examples/prefixed-duckdb-provider.ts` instead. See
+// that file for the two overrides this demo relies on.
+import { PrefixedDuckDBProvider } from './prefixed-duckdb-provider.ts';
 
 console.log(duckdb.version());
 
@@ -370,7 +374,10 @@ const KNOWN_TENANTS = new Set(['db1', 'db2']);
 
 // The provider is constructed with nothing but a name — it holds no
 // database, and there is no `initialize()` to call anymore.
-const duck = new DuckDBProvider({ name: 'DuckDBProvider' });
+// `PrefixedDuckDBProvider` is the example subclass that turns
+// `res.locals.key` (set by the middleware below) into a `<key>_` table
+// prefix — see `examples/prefixed-duckdb-provider.ts`.
+const duck = new PrefixedDuckDBProvider({ name: 'PrefixedDuckDBProvider' });
 
 // Create OGC API instance. `basePath` is omitted: generated links follow
 // the mount path (`req.baseUrl`), which is what makes a parametrized mount

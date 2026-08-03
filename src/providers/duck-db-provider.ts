@@ -15,8 +15,6 @@ import { BaseProvider, type ProviderDef } from '@/providers/base-provider';
 
 export interface DuckDBLocals {
     db: DuckDBConnection;
-    /** Tenant key. Tables for this tenant are named `<key>_<collection>`. Omit for a flat, single-tenant database. */
-    key?: string;
 }
 
 export interface DuckDBProviderDef extends ProviderDef {}
@@ -58,32 +56,6 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
-     * The tenant key for this request, if middleware set one.
-     *
-     * Absent `key` (middleware never set the property at all) means "flat,
-     * single-tenant database" — a supported mode. But if `res.locals` *has* a
-     * `key` property, its value must be a non-empty string of `[A-Za-z0-9]`
-     * only: empty string must not silently mean "no tenant" (that would make
-     * discovery list the whole catalog and every table reference go
-     * unprefixed), and `_` must not be allowed in the key (it's the
-     * `<key>_<collection>` separator — allowing it would let one tenant's key
-     * be a prefix of another's, e.g. `acme` reading into `acme_eu`'s tables).
-     */
-    private tenantKey(req: DuckDBRequest): string | undefined {
-        const locals = req.res?.locals;
-        if (!locals || !('key' in locals)) {
-            return undefined;
-        }
-        const key = locals.key;
-        if (typeof key !== 'string' || key.length === 0 || !/^[A-Za-z0-9]+$/.test(key)) {
-            throw new Error(
-                `Invalid res.locals.key: ${JSON.stringify(key)} — tenant key must be a non-empty string containing only letters and digits (no underscores, which are reserved as the tenant/collection separator)`
-            );
-        }
-        return key;
-    }
-
-    /**
      * Quote an identifier for interpolation. DuckDB identifiers are double-quoted
      * and an embedded quote is doubled. Reject a NUL byte outright.
      */
@@ -95,24 +67,43 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
-     * Map a collection id to its physical table name. Tenants are table-name
-     * prefixes on one shared database/connection, not separate schemas or
-     * databases: with a key, every table a tenant can see or touch is named
-     * `<key>_<collectionId>`. This is the only place that builds a physical
-     * table name — every quoted table reference and every `information_schema`
-     * lookup goes through it (or through a name it already produced).
+     * Map a collection id to the physical table name to query. This is the
+     * library's extension point for namespacing schemes (per-tenant table
+     * prefixes, schema qualification, or anything else): every quoted table
+     * reference and every `information_schema` lookup in this class calls
+     * this method (or reuses a name it already produced) rather than using
+     * `collectionId` directly.
      *
-     * This is also what keeps the prefix from being bypassable: the key always
-     * comes from `res.locals`, set by trusted middleware, never from caller
-     * input, and it is always *prepended*, never parsed back out of
-     * `collectionId`. A tenant with key `db1` passing a crafted collectionId
-     * like `../db2_parks` or `db2_parks` still only ever addresses
-     * `db1_../db2_parks` or `db1_db2_parks` — tables that don't exist — never
-     * `db2_parks` itself. There is no code path that strips or reinterprets the
-     * prefix based on what the caller sent.
+     * The default implementation is the identity: `collectionId` *is* the
+     * table name. Override it to add a prefix or other mapping — but see
+     * `collectionIdForTable`, its required inverse: whatever this method
+     * does to go from collection id to table name, that method must undo,
+     * or a client will be able to request a collection id that discovery
+     * never advertised, or one request's mapping will resolve to a table
+     * that belongs to a different tenant/request.
      */
-    private physicalName(collectionId: string, key: string | undefined): string {
-        return key ? `${key}_${collectionId}` : collectionId;
+    protected physicalTableName(_req: DuckDBRequest, collectionId: string): string {
+        return collectionId;
+    }
+
+    /**
+     * Map a discovered table name (as returned by `information_schema.tables`)
+     * to the collection id it should be exposed as for this request, or
+     * `null` to hide it from this request entirely. `discoverCollections`
+     * maps every table it finds through this method and drops every `null`.
+     *
+     * The default implementation is the identity: every table is a
+     * collection, named after itself. This must stay the exact inverse of
+     * `physicalTableName`: for every collection id `c` a request should be
+     * able to see, `collectionIdForTable(req, physicalTableName(req, c))`
+     * must equal `c`. Breaking that symmetry — prefixing in one direction
+     * without stripping in the other, say — means a client sees a
+     * collection in `GET /collections` that then 404s when it tries to read
+     * it, or, worse, silently resolves to a table outside what this request
+     * should be able to reach.
+     */
+    protected collectionIdForTable(_req: DuckDBRequest, tableName: string): string | null {
+        return tableName;
     }
 
     /**
@@ -120,7 +111,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * table. DuckDB's binder rejects a WHERE clause that references a column
      * the table doesn't have, so a hardcoded `id = ? OR fid = ?` fails on any
      * table without a `fid` column — this discovers what is really there.
-     * `tableName` is a physical (already-prefixed) name.
+     * `tableName` is a physical table name (as produced by `physicalTableName`).
      */
     private async idColumns(db: DuckDBConnection, tableName: string): Promise<string[]> {
         const reader = await db.runAndReadAll(`
@@ -143,7 +134,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * The geometry column of a table, if any. `broad` widens the match beyond
      * `GEOMETRY` to the specific spatial types too (used for extent discovery,
      * where the column may not literally be typed `GEOMETRY`). `tableName` is a
-     * physical (already-prefixed) name.
+     * physical table name (as produced by `physicalTableName`).
      */
     private async geometryColumn(
         db: DuckDBConnection,
@@ -264,15 +255,8 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
     private async discoverCollections(req: DuckDBRequest): Promise<Collection[]> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
 
-        const reader = key
-            ? await db.runAndReadAll(`
-                SELECT table_name
-                FROM information_schema.tables
-                WHERE table_schema = current_schema() AND starts_with(table_name, ?)
-                `, [`${key}_`])
-            : await db.runAndReadAll(`
+        const reader = await db.runAndReadAll(`
                 SELECT table_name
                 FROM information_schema.tables
                 WHERE table_schema = current_schema()
@@ -282,7 +266,10 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const collections: Collection[] = [];
         for (const row of reader.getRowObjectsJS()) {
             const tableName = String(row['table_name']);
-            const collectionId = key ? tableName.slice(key.length + 1) : tableName;
+            const collectionId = this.collectionIdForTable(req, tableName);
+            if (collectionId === null) {
+                continue;
+            }
             collections.push({
                 id: collectionId,
                 title: collectionId,
@@ -297,8 +284,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
     async getCollection(req: DuckDBRequest, collectionId: string): Promise<Collection | null> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         // Targeted lookup — never builds the whole collection list. `getCollection`
         // is called before every item read in items-curd.ts, so this must stay a
@@ -323,7 +309,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         };
     }
 
-    /** `tableName` is a physical (already-prefixed) name. */
+    /** `tableName` is a physical table name (as produced by `physicalTableName`). */
     private async getTableExtent(db: DuckDBConnection, tableName: string): Promise<any> {
         try {
             const geometryColumn = await this.geometryColumn(db, tableName, true);
@@ -362,8 +348,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
     async getSchema(req: DuckDBRequest, collectionId: string): Promise<Record<string, unknown>> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const columns = await db.runAndReadAll(`
       SELECT column_name, data_type
@@ -401,8 +386,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         params: QueryParams
     ): Promise<FeatureCollection> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const limit = Math.min(params.limit || this.defaultLimit, this.maxLimit);
         const offset = params.offset || 0;
@@ -438,7 +422,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         };
     }
 
-    /** `tableName` is a physical (already-prefixed) name. */
+    /** `tableName` is a physical table name (as produced by `physicalTableName`). */
     private async getFeatureCount(
         db: DuckDBConnection,
         tableName: string,
@@ -466,8 +450,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         featureId: string
     ): Promise<Feature | null> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const geometryColumn = await this.geometryColumn(db, tableName);
 
@@ -504,8 +487,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
     async createFeature(req: DuckDBRequest, collectionId: string, feature: Feature): Promise<Feature | null> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const columns = Object.keys(feature.properties || {});
         const values = Object.values(feature.properties || {}) as DuckDBValue[];
@@ -546,8 +528,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         feature: Feature
     ): Promise<Feature | null> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const columns = Object.keys(feature.properties || {});
         const values = Object.values(feature.properties || {}) as DuckDBValue[];
@@ -589,8 +570,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         params: UpdateFeatureParams
     ): Promise<Feature | null> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const updates = params.feature.properties || {};
         const columns = Object.keys(updates);
@@ -617,8 +597,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
     async deleteFeature(req: DuckDBRequest, collectionId: string, featureId: string): Promise<boolean> {
         const db = this.conn(req);
-        const key = this.tenantKey(req);
-        const tableName = this.physicalName(collectionId, key);
+        const tableName = this.physicalTableName(req, collectionId);
 
         const idCols = await this.idColumns(db, tableName);
         const query = `DELETE FROM ${this.quote(tableName)} WHERE ${this.idClause(idCols)}`;
