@@ -151,6 +151,52 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
+     * The name of the table's identifier column, but only when it can
+     * actually assign a value on INSERT — i.e. it has a column default (a
+     * sequence via `DEFAULT nextval('...')`, or any other default
+     * expression) — and only when identifier discovery is unambiguous (see
+     * `idColumns`/`idColumn` in `getSchema`: 'id' and 'fid' are both
+     * conventional names, and if a table happens to define both there's no
+     * clean way to say which one is *the* identifier, so this backs off
+     * rather than guessing).
+     *
+     * `column_default` is read from `information_schema.columns` — probed
+     * directly against a `DEFAULT nextval('seq')` column and confirmed to
+     * render the default expression (e.g. `"nextval('demo_points_id_seq')"`)
+     * there, `NULL` for a column with no default. `duckdb_columns()` (the
+     * source `getSchema`/`temporalColumnKinds` otherwise prefer for other
+     * metadata) exposes the identical value under the same column name, so
+     * either would work here; `information_schema.columns` is used because
+     * every other identifier-related lookup in this class (`idColumns`,
+     * `columnNames`) already reads that view, and there is no other metadata
+     * this call needs that only `duckdb_columns()` carries.
+     *
+     * `createFeature` uses this to omit a client-supplied value for this
+     * column from the INSERT column list, so the database's own default
+     * fires — a literal value in an `INSERT` always beats a column
+     * `DEFAULT`, so simply having the default declared is not enough by
+     * itself. `tableName` is a physical table name (as produced by
+     * `physicalTableName`).
+     */
+    private async idColumnWithDefault(
+        db: DuckDBConnection,
+        tableName: string,
+        idCols: string[]
+    ): Promise<string | undefined> {
+        if (idCols.length !== 1) {
+            return undefined;
+        }
+        const column = idCols[0]!;
+        const reader = await db.runAndReadAll(`
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?
+            `, [tableName, column]);
+        const row = reader.getRowObjectsJS()[0];
+        return row && row['column_default'] != null ? column : undefined;
+    }
+
+    /**
      * Every column name on a table — the `allowedProperties` a `Cql2ToSql`
      * instance needs so an unknown queryable in a `filter` is rejected with a
      * clean `UNKNOWN_PROPERTY` (→ 400) instead of reaching the database as a
@@ -289,6 +335,44 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
         const row = reader.getRowObjectsJS()[0];
         return row ? String(row['column_name']) : undefined;
+    }
+
+    /**
+     * Remove a `properties` entry whose key exactly matches the *discovered*
+     * geometry column name, returning a shallow copy (`properties` itself is
+     * never mutated).
+     *
+     * QGIS's OGC API - Features Part 5 client reads the geometry column from
+     * `GET /collections/{id}/schema` — correctly tagged there
+     * `x-ogc-role: 'primary-geometry'` inside `properties`, which is what
+     * lets QGIS identify it — but then treats that column as an ordinary
+     * attribute field too, and round-trips a same-named (typically `null`)
+     * entry inside `properties` on create/replace/update, alongside the real
+     * top-level GeoJSON `geometry`. The top-level member is the sole
+     * authority for geometry: a same-named `properties` entry is a client
+     * artifact, not a second, competing value for the same column. Left
+     * unstripped, it either duplicates the column in an INSERT's column list
+     * (DuckDB rejects that outright: `Binder Error: Duplicate column name
+     * "..." in INSERT`) or, on an UPDATE/PATCH, silently overwrites a
+     * geometry the client never intended to touch.
+     *
+     * Matched against `geometryColumn` — the name discovery actually
+     * resolved to (`geom`, `wkb_geometry`, ... whatever the table really
+     * calls it) — never the literal string `'geometry'`, since a table
+     * happening to have an unrelated property genuinely named `geometry`
+     * would otherwise be impossible to distinguish from this. And only when
+     * that exact key is present: an unrelated property that happens to be
+     * `null` is left completely untouched.
+     */
+    private stripDiscoveredGeometryProperty(
+        properties: Record<string, unknown>,
+        geometryColumn: string | undefined
+    ): Record<string, unknown> {
+        if (!geometryColumn || !(geometryColumn in properties)) {
+            return properties;
+        }
+        const { [geometryColumn]: _omitted, ...rest } = properties;
+        return rest;
     }
 
     /**
@@ -712,6 +796,20 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const idCols = await this.idColumns(db, tableName);
         const idColumn = idCols.length === 1 ? idCols[0] : undefined;
 
+        // A column with a database default (see `createFeature`'s use of
+        // this for the same reason) is one the *server* can and will supply
+        // on create — `required` in this schema is read by clients (QGIS
+        // included) to decide which fields a create form must collect from
+        // the user before submitting. Leaving a server-assigned id in
+        // `required` would tell a well-behaved client to demand a value the
+        // server is going to discard anyway (see `createFeature`), which is
+        // actively wrong now, not merely redundant. `is_nullable` alone
+        // can't distinguish this: the column is still `NOT NULL` at the
+        // storage layer (that's what makes it usable as a primary key) —
+        // the database default is what changes whether the *client* still
+        // has to provide it.
+        const assignedIdColumn = await this.idColumnWithDefault(db, tableName, idCols);
+
         const properties: Record<string, CollectionSchemaProperty> = {};
         const required: string[] = [];
 
@@ -769,7 +867,9 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
             // `duckdb_columns().is_nullable` is a real boolean (unlike
             // `information_schema.columns`, which renders 'YES'/'NO' strings).
-            if (col['is_nullable'] === false) {
+            // A server-assigned id column (see above) is deliberately
+            // excluded even though it is NOT NULL in the database.
+            if (col['is_nullable'] === false && columnName !== assignedIdColumn) {
                 required.push(columnName);
             }
         }
@@ -1060,8 +1160,34 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const db = this.conn(req);
         const tableName = this.physicalTableName(req, collectionId);
 
-        const columns = Object.keys(feature.properties || {});
-        const values = Object.values(feature.properties || {}) as DuckDBValue[];
+        // Resolved once and reused both to strip a same-named `properties`
+        // artifact (see `stripDiscoveredGeometryProperty`) and, below, to
+        // know which column a top-level geometry should be written into.
+        const geometryColumnName = await this.geometryColumn(db, tableName);
+        let properties = this.stripDiscoveredGeometryProperty(feature.properties ?? {}, geometryColumnName);
+
+        // OGC API - Features Part 4 has the server assign the resource id on
+        // create. That's only actually possible when the identifier column
+        // has a database default to fall back on (see `idColumnWithDefault`)
+        // — a client-supplied value beats a plain column `DEFAULT` in an
+        // INSERT, so the value has to be dropped from the column list
+        // entirely, not merely left to a default that would never fire.
+        // Without this, a QGIS client that picks its own id from a stale
+        // view of the layer (and collides with an existing row) can never
+        // successfully add a feature — the 409 the server correctly returns
+        // is not something the client can recover from on its own. A table
+        // whose identifier column has no default keeps today's behaviour
+        // exactly: the client's value is honoured, and a collision still
+        // surfaces as a 409 (see `translateWriteError`).
+        const idCols = await this.idColumns(db, tableName);
+        const assignedIdColumn = await this.idColumnWithDefault(db, tableName, idCols);
+        if (assignedIdColumn && assignedIdColumn in properties) {
+            const { [assignedIdColumn]: _discardedClientId, ...rest } = properties;
+            properties = rest;
+        }
+
+        const columns = Object.keys(properties);
+        const values = Object.values(properties) as DuckDBValue[];
         const placeholders = columns.map(() => '?');
 
         if (feature.geometry) {
@@ -1069,7 +1195,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             // assuming it's literally named 'geometry' — GDAL/shapefile imports
             // commonly call it 'geom' or 'wkb_geometry'. Fall back to 'geometry'
             // only if the table doesn't have a recognizable spatial column yet.
-            const geometryColumn = (await this.geometryColumn(db, tableName)) ?? 'geometry';
+            const geometryColumn = geometryColumnName ?? 'geometry';
             columns.push(geometryColumn);
             placeholders.push('ST_GeomFromGeoJSON(?)');
             values.push(JSON.stringify(feature.geometry));
@@ -1085,7 +1211,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         try {
             reader = await db.runAndReadAll(query, values);
         } catch (err) {
-            throw this.translateWriteError(err, feature.properties ?? {});
+            throw this.translateWriteError(err, properties);
         }
         const row = reader.getRowObjectsJS()[0];
 
@@ -1106,15 +1232,20 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const db = this.conn(req);
         const tableName = this.physicalTableName(req, collectionId);
 
-        const columns = Object.keys(feature.properties || {});
-        const values = Object.values(feature.properties || {}) as DuckDBValue[];
+        // See createFeature: resolved once, reused to strip a same-named
+        // `properties` artifact and to target the real geometry column below.
+        const geometryColumnName = await this.geometryColumn(db, tableName);
+        const properties = this.stripDiscoveredGeometryProperty(feature.properties ?? {}, geometryColumnName);
+
+        const columns = Object.keys(properties);
+        const values = Object.values(properties) as DuckDBValue[];
         const setParts = columns.map((col) => `${this.quote(col)} = ?`);
 
         if (feature.geometry) {
             // Same handling as createFeature: target the geometry column the
             // table actually has, not a hardcoded name, so a submitted
             // geometry is never silently dropped from a PUT.
-            const geometryColumn = (await this.geometryColumn(db, tableName)) ?? 'geometry';
+            const geometryColumn = geometryColumnName ?? 'geometry';
             setParts.push(`${this.quote(geometryColumn)} = ST_GeomFromGeoJSON(?)`);
             values.push(JSON.stringify(feature.geometry));
         }
@@ -1137,7 +1268,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         try {
             await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
         } catch (err) {
-            throw this.translateWriteError(err, feature.properties ?? {});
+            throw this.translateWriteError(err, properties);
         }
 
         return await this.getFeature(req, collectionId, featureId);
@@ -1152,7 +1283,16 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const db = this.conn(req);
         const tableName = this.physicalTableName(req, collectionId);
 
-        const updates = params.feature.properties || {};
+        // `updateFeature` (PATCH) never writes a top-level `feature.geometry`
+        // to the geometry column at all today — only `properties` are ever
+        // applied. That makes stripping the same-named `properties` entry
+        // even more important here than for create/replace: without it, a
+        // QGIS-shaped PATCH body carrying `"geometry": null` in `properties`
+        // (alongside a top-level geometry this method doesn't otherwise
+        // touch) would silently null out the stored geometry instead of
+        // leaving it alone.
+        const geometryColumnName = await this.geometryColumn(db, tableName);
+        const updates = this.stripDiscoveredGeometryProperty(params.feature.properties ?? {}, geometryColumnName);
         const columns = Object.keys(updates);
         const values = Object.values(updates) as DuckDBValue[];
 

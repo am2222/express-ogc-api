@@ -151,6 +151,57 @@ describe('DuckDBProvider', () => {
       INSERT INTO people VALUES (1, 'O''Brien'), (2, 'Smith');
     `);
 
+    // Fixture for the QGIS "duplicate geometry column" regression
+    // (`stripDiscoveredGeometryProperty`): shaped like the real table QGIS's
+    // captured request body was sent against — a `geometry` column plus
+    // ordinary attribute columns, and existing ids 1-3 so a client-supplied
+    // colliding id has something real to conflict with.
+    await db.run(`
+      CREATE TABLE qgis_polygons (
+        id INTEGER PRIMARY KEY,
+        name VARCHAR,
+        zone_type VARCHAR,
+        geometry GEOMETRY
+      );
+      INSERT INTO qgis_polygons VALUES
+        (1, 'Zone A', 'residential', ST_GeomFromText('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))')),
+        (2, 'Zone B', 'commercial', ST_GeomFromText('POLYGON((2 0, 2 1, 3 1, 3 0, 2 0))')),
+        (3, 'Zone C', 'industrial', ST_GeomFromText('POLYGON((4 0, 4 1, 5 1, 5 0, 4 0))'));
+    `);
+
+    // Same shape, but the geometry column is named `geom`, not `geometry` —
+    // proves the exclusion keys off the *discovered* column name, not the
+    // literal string `'geometry'`.
+    await db.run(`
+      CREATE TABLE qgis_polygons_geom_named (
+        id INTEGER PRIMARY KEY,
+        name VARCHAR,
+        geom GEOMETRY
+      );
+      INSERT INTO qgis_polygons_geom_named VALUES
+        (1, 'Existing', ST_GeomFromText('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))'));
+    `);
+
+    // Same shape as `qgis_polygons`, but the id column is backed by a
+    // sequence default (`examples/build-demo-duckdb.ts` now gives every demo
+    // table exactly this shape). Seeded rows still supply an explicit id —
+    // an explicit value in an INSERT beats a column DEFAULT, same as any
+    // other write — so ids 1-3 exist here too, and the sequence starts at
+    // 100 so a generated id never collides with them.
+    await db.run(`
+      CREATE SEQUENCE seq_polygons_id_seq START 100;
+      CREATE TABLE seq_polygons (
+        id INTEGER PRIMARY KEY DEFAULT nextval('seq_polygons_id_seq'),
+        name VARCHAR,
+        zone_type VARCHAR,
+        geometry GEOMETRY
+      );
+      INSERT INTO seq_polygons (id, name, zone_type, geometry) VALUES
+        (1, 'Zone A', 'residential', ST_GeomFromText('POLYGON((0 0, 0 1, 1 1, 1 0, 0 0))')),
+        (2, 'Zone B', 'commercial', ST_GeomFromText('POLYGON((2 0, 2 1, 3 1, 3 0, 2 0))')),
+        (3, 'Zone C', 'industrial', ST_GeomFromText('POLYGON((4 0, 4 1, 5 1, 5 0, 4 0))'));
+    `);
+
     provider = new DuckDBProvider({ name: 'DuckDBProvider' });
   });
 
@@ -1147,6 +1198,432 @@ describe('DuckDBProvider', () => {
           close();
         }
       });
+    });
+  });
+
+  describe('QGIS write regression: duplicate geometry property (Part 4)', () => {
+    // The exact body shape a real QGIS client sent (captured from the
+    // request log): a top-level `geometry` alongside a `properties` map
+    // that *also* carries a `geometry` key (typically `null`, since QGIS
+    // read it from the schema as an ordinary attribute field). Before the
+    // fix, `createFeature`/`replaceFeature`/`updateFeature` built their
+    // column list straight from `Object.keys(feature.properties)`, which
+    // included this artifact, and then appended the discovered geometry
+    // column a second time for the real top-level geometry — DuckDB
+    // rejects an INSERT with a duplicate column name outright.
+    function qgisShapedBody(overrides: {
+      id: number;
+      geometry: unknown;
+      properties: Record<string, unknown>;
+    }) {
+      return {
+        type: 'Feature',
+        geometry: overrides.geometry,
+        properties: { id: overrides.id, ...overrides.properties },
+      };
+    }
+
+    function startServer(): { baseUrl: string; close: () => void } {
+      const app = express();
+      app.use((_req, res, next) => {
+        res.locals.db = db;
+        next();
+      });
+      const ogc = new OGCAPI(provider, app, {});
+      app.use(ogc.getRouter());
+      const server = app.listen(0);
+      const baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+      return { baseUrl, close: () => server.close() };
+    }
+
+    it('POST: a QGIS-shaped body (properties.geometry alongside top-level geometry) creates the feature with the top-level geometry, not clobbered', async () => {
+      const newGeometry = { type: 'Polygon', coordinates: [[[10, 10], [10, 11], [11, 11], [11, 10], [10, 10]]] };
+
+      const created = await provider.createFeature(
+        fakeReq(db),
+        'qgis_polygons',
+        qgisShapedBody({
+          id: 50,
+          geometry: newGeometry,
+          properties: { name: 'New Zone', zone_type: 'test', geometry: null },
+        }) as any
+      );
+
+      expect(created).not.toBeNull();
+      expect(created?.properties.name).toBe('New Zone');
+      // The property artifact must not leak back out either.
+      expect(created?.properties.geometry).toBeUndefined();
+      // The top-level geometry — not the `null` sitting in `properties` — is
+      // what got stored.
+      expect(created?.geometry).toEqual(newGeometry);
+
+      // Re-read independently: confirms it was actually persisted this way,
+      // not just echoed back from the in-memory argument.
+      const reread = await provider.getFeature(fakeReq(db), 'qgis_polygons', '50');
+      expect(reread?.geometry).toEqual(newGeometry);
+      expect(reread?.properties.name).toBe('New Zone');
+
+      expect(await provider.deleteFeature(fakeReq(db), 'qgis_polygons', '50')).toBe(true);
+    });
+
+    it('PUT: the same QGIS-shaped body replaces the feature with the top-level geometry, not clobbered', async () => {
+      const newGeometry = { type: 'Polygon', coordinates: [[[20, 20], [20, 21], [21, 21], [21, 20], [20, 20]]] };
+
+      const replaced = await provider.replaceFeature(
+        fakeReq(db),
+        'qgis_polygons',
+        '2',
+        qgisShapedBody({
+          id: 2,
+          geometry: newGeometry,
+          properties: { name: 'Zone B replaced', zone_type: 'commercial', geometry: null },
+        }) as any
+      );
+
+      expect(replaced?.geometry).toEqual(newGeometry);
+      expect(replaced?.properties.name).toBe('Zone B replaced');
+      expect(replaced?.properties.geometry).toBeUndefined();
+
+      const reread = await provider.getFeature(fakeReq(db), 'qgis_polygons', '2');
+      expect(reread?.geometry).toEqual(newGeometry);
+
+      // Restore Zone B's original state so later tests (which assume the
+      // fixture is untouched) aren't affected.
+      await provider.replaceFeature(fakeReq(db), 'qgis_polygons', '2', {
+        type: 'Feature',
+        id: 2,
+        geometry: { type: 'Polygon', coordinates: [[[2, 0], [2, 1], [3, 1], [3, 0], [2, 0]]] },
+        properties: { name: 'Zone B', zone_type: 'commercial' },
+      });
+    });
+
+    it('PATCH: the same QGIS-shaped body does not null out the stored geometry (properties.geometry is excluded, not applied)', async () => {
+      const before = await provider.getFeature(fakeReq(db), 'qgis_polygons', '3');
+      expect(before?.geometry).not.toBeNull();
+
+      // `updateFeature` (PATCH) does not apply a top-level `feature.geometry`
+      // to the geometry column at all (a pre-existing limitation, unrelated
+      // to this fix) — only `properties` are ever written. The assertion
+      // that matters here is narrower than PUT's: the artifact key must not
+      // reach the geometry column and null it out.
+      const updated = await provider.updateFeature(fakeReq(db), 'qgis_polygons', '3', {
+        feature: qgisShapedBody({
+          id: 3,
+          geometry: { type: 'Polygon', coordinates: [[[30, 30], [30, 31], [31, 31], [31, 30], [30, 30]]] },
+          properties: { name: 'Zone C patched', geometry: null },
+        }) as any,
+      });
+
+      expect(updated?.properties.name).toBe('Zone C patched');
+      expect(updated?.geometry).not.toBeNull();
+      expect(updated?.geometry).toEqual(before?.geometry);
+
+      const reread = await provider.getFeature(fakeReq(db), 'qgis_polygons', '3');
+      expect(reread?.geometry).toEqual(before?.geometry);
+
+      // Restore.
+      await provider.updateFeature(fakeReq(db), 'qgis_polygons', '3', {
+        feature: { type: 'Feature', id: 3, geometry: null, properties: { name: 'Zone C' } },
+      });
+    });
+
+    it('the exclusion keys off the discovered column name, not the literal string "geometry" (table geometry column is "geom")', async () => {
+      const newGeometry = { type: 'Polygon', coordinates: [[[40, 40], [40, 41], [41, 41], [41, 40], [40, 40]]] };
+
+      const created = await provider.createFeature(fakeReq(db), 'qgis_polygons_geom_named', {
+        type: 'Feature',
+        id: 2,
+        geometry: newGeometry,
+        // The QGIS artifact this time targets `geom`, matching this table's
+        // actual (discovered) geometry column — not the literal 'geometry'.
+        properties: { id: 2, name: 'Named geom', geom: null },
+      } as any);
+
+      expect(created).not.toBeNull();
+      expect(created?.geometry).toEqual(newGeometry);
+      expect(created?.properties.geom).toBeUndefined();
+      expect(created?.properties.name).toBe('Named geom');
+
+      const reread = await provider.getFeature(fakeReq(db), 'qgis_polygons_geom_named', '2');
+      expect(reread?.geometry).toEqual(newGeometry);
+
+      expect(await provider.deleteFeature(fakeReq(db), 'qgis_polygons_geom_named', '2')).toBe(true);
+    });
+
+    it('a property genuinely null under a different key still round-trips (the exclusion is narrow)', async () => {
+      const created = await provider.createFeature(fakeReq(db), 'qgis_polygons', {
+        type: 'Feature',
+        id: 51,
+        geometry: { type: 'Polygon', coordinates: [[[50, 50], [50, 51], [51, 51], [51, 50], [50, 50]]] },
+        // `zone_type` is a real column, genuinely null — must not be swept
+        // up by an over-broad exclusion.
+        properties: { id: 51, name: 'Null zone', zone_type: null },
+      } as any);
+
+      expect(created).not.toBeNull();
+      expect(created?.properties.zone_type).toBeNull();
+      expect('zone_type' in (created?.properties ?? {})).toBe(true);
+
+      expect(await provider.deleteFeature(fakeReq(db), 'qgis_polygons', '51')).toBe(true);
+    });
+
+    it('POST with a client-supplied id that already exists is a clean 409, not an HTML 500 leaking SQL', async () => {
+      const { baseUrl, close } = startServer();
+      try {
+        const res = await fetch(`${baseUrl}/collections/qgis_polygons/items`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/geo+json' },
+          body: JSON.stringify(
+            qgisShapedBody({
+              id: 1, // already exists in the fixture
+              geometry: { type: 'Polygon', coordinates: [[[60, 60], [60, 61], [61, 61], [61, 60], [60, 60]]] },
+              properties: { name: 'Duplicate id', zone_type: 'test', geometry: null },
+            })
+          ),
+        });
+        const contentType = res.headers.get('content-type') ?? '';
+        const bodyText = await res.text();
+
+        expect(res.status).toBe(409);
+        expect(contentType).toContain('json');
+        expect(bodyText).not.toContain('<html');
+        expect(bodyText).not.toContain('INSERT INTO');
+        expect(bodyText).not.toContain('qgis_polygons');
+
+        const body = JSON.parse(bodyText) as { code: string; description: string };
+        expect(body.description).toContain('id');
+        expect(body.description).toContain('1');
+      } finally {
+        close();
+      }
+    });
+  });
+
+  describe('server-assigned ids (Part 4: letting the database assign the id on create)', () => {
+    // The exact captured QGIS "add feature" body shape: a top-level
+    // `geometry`, a `properties.geometry` artifact (see the describe block
+    // above), and — the part that matters here — an `id` the client picked
+    // from its own stale view of the layer.
+    function qgisShapedBody(overrides: {
+      id?: number;
+      geometry: unknown;
+      properties: Record<string, unknown>;
+    }) {
+      return {
+        type: 'Feature',
+        geometry: overrides.geometry,
+        properties: overrides.id === undefined ? { ...overrides.properties } : { id: overrides.id, ...overrides.properties },
+      };
+    }
+
+    function startServer(): { baseUrl: string; close: () => void } {
+      const app = express();
+      app.use((_req, res, next) => {
+        res.locals.db = db;
+        next();
+      });
+      const ogc = new OGCAPI(provider, app, {});
+      app.use(ogc.getRouter());
+      const server = app.listen(0);
+      const baseUrl = `http://localhost:${(server.address() as AddressInfo).port}`;
+      return { baseUrl, close: () => server.close() };
+    }
+
+    it('POST without an id to a sequence-backed table gets a generated id in both the body and the Location header, and is retrievable there', async () => {
+      const { baseUrl, close } = startServer();
+      try {
+        const res = await fetch(`${baseUrl}/collections/seq_polygons/items`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/geo+json' },
+          body: JSON.stringify({
+            type: 'Feature',
+            geometry: { type: 'Polygon', coordinates: [[[70, 70], [70, 71], [71, 71], [71, 70], [70, 70]]] },
+            properties: { name: 'No id supplied', zone_type: 'test' },
+          }),
+        });
+        const body = (await res.json()) as { id: number | string; properties: { name: string } };
+
+        expect(res.status).toBe(201);
+        // Generated by the sequence (START 100) — the seeded fixture only
+        // goes up to 3, so any assigned id must be outside that range.
+        expect(Number(body.id)).toBeGreaterThanOrEqual(100);
+        expect(body.properties.name).toBe('No id supplied');
+
+        const location = res.headers.get('location');
+        expect(location).toBeTruthy();
+        expect(location).toContain(`/collections/seq_polygons/items/${body.id}`);
+
+        // Retrievable at the id the server actually assigned.
+        const getRes = await fetch(`${baseUrl}/collections/seq_polygons/items/${body.id}`);
+        expect(getRes.status).toBe(200);
+        const fetched = (await getRes.json()) as { properties: { name: string } };
+        expect(fetched.properties.name).toBe('No id supplied');
+      } finally {
+        close();
+      }
+    });
+
+    it('POST with a client-supplied id that COLLIDES with an existing row, against a sequence-backed table, gets 201 with a DIFFERENT generated id — the QGIS case', async () => {
+      // This is the core regression test: id 1 already exists in
+      // `seq_polygons`. Before this feature, this would 409 (the existing,
+      // correct-but-unhelpful behaviour QGIS's "add feature" gets stuck on).
+      // If the id-discarding logic in `createFeature` were removed, this
+      // request would revert to inserting the literal id 1 and collide,
+      // reproducing the 409 — that's the failure mode this test is written
+      // to catch.
+      const { baseUrl, close } = startServer();
+      try {
+        const res = await fetch(`${baseUrl}/collections/seq_polygons/items`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/geo+json' },
+          body: JSON.stringify(
+            qgisShapedBody({
+              id: 1, // collides with the seeded row
+              geometry: { type: 'Polygon', coordinates: [[[80, 80], [80, 81], [81, 81], [81, 80], [80, 80]]] },
+              properties: { name: 'Colliding id', zone_type: 'test', geometry: null },
+            })
+          ),
+        });
+        const body = (await res.json()) as { id: number | string; properties: { name: string } };
+
+        expect(res.status).toBe(201);
+        expect(Number(body.id)).not.toBe(1);
+        expect(Number(body.id)).toBeGreaterThanOrEqual(100);
+        expect(body.properties.name).toBe('Colliding id');
+
+        // The original row at id 1 must be untouched — the client's value
+        // was discarded, not applied as an overwrite.
+        const original = await provider.getFeature(fakeReq(db), 'seq_polygons', '1');
+        expect(original?.properties.name).toBe('Zone A');
+
+        const location = res.headers.get('location');
+        expect(location).toContain(`/collections/seq_polygons/items/${body.id}`);
+      } finally {
+        close();
+      }
+    });
+
+    it('POST with a client-supplied, non-colliding id to a table WITHOUT a default: honoured, unchanged from today', async () => {
+      const created = await provider.createFeature(fakeReq(db), 'qgis_polygons', {
+        type: 'Feature',
+        id: 77,
+        geometry: { type: 'Polygon', coordinates: [[[90, 90], [90, 91], [91, 91], [91, 90], [90, 90]]] },
+        properties: { id: 77, name: 'Honoured id', zone_type: 'test' },
+      } as any);
+
+      expect(created).not.toBeNull();
+      // The client's id was actually used — not silently replaced.
+      expect(Number(created?.id)).toBe(77);
+
+      const reread = await provider.getFeature(fakeReq(db), 'qgis_polygons', '77');
+      expect(reread?.properties.name).toBe('Honoured id');
+
+      expect(await provider.deleteFeature(fakeReq(db), 'qgis_polygons', '77')).toBe(true);
+    });
+
+    it('POST with a client-supplied id that collides, to a table WITHOUT a default: still 409, unchanged from today', async () => {
+      let caught: unknown;
+      try {
+        await provider.createFeature(fakeReq(db), 'qgis_polygons', {
+          type: 'Feature',
+          id: 2, // already exists
+          geometry: null,
+          properties: { id: 2, name: 'Should collide', zone_type: 'test' },
+        } as any);
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(FeatureValidationError);
+      expect((caught as FeatureValidationError).status).toBe(409);
+    });
+
+    it('the full QGIS-captured body shape (stray properties.geometry, plus a colliding id) against a sequence-backed table: 201, correct geometry, generated id', async () => {
+      // Shaped exactly like the request captured from a real QGIS client:
+      // top-level geometry, a same-named `properties.geometry` (null)
+      // artifact left over from QGIS treating the geometry column as an
+      // ordinary attribute field, and an `id` picked from QGIS's own,
+      // possibly-stale view of the layer.
+      const newGeometry = { type: 'Polygon', coordinates: [[[95, 95], [95, 96], [96, 96], [96, 95], [95, 95]]] };
+      const { baseUrl, close } = startServer();
+      try {
+        const res = await fetch(`${baseUrl}/collections/seq_polygons/items`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/geo+json' },
+          body: JSON.stringify(
+            qgisShapedBody({
+              id: 3, // collides with the seeded 'Zone C'
+              geometry: newGeometry,
+              properties: { name: 'QGIS added zone', zone_type: 'test', geometry: null },
+            })
+          ),
+        });
+        const body = (await res.json()) as {
+          id: number | string;
+          geometry: unknown;
+          properties: Record<string, unknown>;
+        };
+
+        expect(res.status).toBe(201);
+        expect(Number(body.id)).not.toBe(3);
+        expect(Number(body.id)).toBeGreaterThanOrEqual(100);
+        expect(body.geometry).toEqual(newGeometry);
+        expect(body.properties.name).toBe('QGIS added zone');
+        // The stray properties.geometry artifact must not leak back out.
+        expect(body.properties.geometry).toBeUndefined();
+
+        const reread = await provider.getFeature(fakeReq(db), 'seq_polygons', String(body.id));
+        expect(reread?.geometry).toEqual(newGeometry);
+      } finally {
+        close();
+      }
+    });
+
+    it('two consecutive POSTs (no id supplied) to a sequence-backed table get distinct generated ids', async () => {
+      const first = await provider.createFeature(fakeReq(db), 'seq_polygons', {
+        type: 'Feature',
+        geometry: { type: 'Polygon', coordinates: [[[110, 110], [110, 111], [111, 111], [111, 110], [110, 110]]] },
+        properties: { name: 'First' },
+      } as any);
+      const second = await provider.createFeature(fakeReq(db), 'seq_polygons', {
+        type: 'Feature',
+        geometry: { type: 'Polygon', coordinates: [[[120, 120], [120, 121], [121, 121], [121, 120], [120, 120]]] },
+        properties: { name: 'Second' },
+      } as any);
+
+      expect(first?.id).toBeDefined();
+      expect(second?.id).toBeDefined();
+      expect(first?.id).not.toBe(second?.id);
+      expect(first?.properties.name).toBe('First');
+      expect(second?.properties.name).toBe('Second');
+    });
+
+    it('a sequence-defaulted id column is still x-ogc-role: id, but is no longer listed as required', async () => {
+      const schema = await provider.getSchema(fakeReq(db), 'seq_polygons');
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string }>;
+      const required = schema.required as string[];
+
+      // Still identified as the id column — this is metadata about what the
+      // column *is*, unaffected by whether the database can assign it.
+      expect(properties.id['x-ogc-role']).toBe('id');
+
+      // No longer required: the server assigns it on create (see
+      // `createFeature`), so a client is not expected to supply one — and
+      // listing it as required would tell a well-behaved client (QGIS
+      // included) to demand a value from the user that the server is going
+      // to discard anyway.
+      expect(required).not.toContain('id');
+      // Other NOT NULL-by-virtue-of-being-a-column-that-happens-to-have-data
+      // constraints are unaffected — this table has no other NOT NULL
+      // column, so nothing else to assert here beyond "id" being absent.
+    });
+
+    it('an id column WITHOUT a default is still listed as required (unchanged) — contrast with the sequence-backed case above', async () => {
+      // `qgis_polygons.id` has no column default at all.
+      const schema = await provider.getSchema(fakeReq(db), 'qgis_polygons');
+      const required = schema.required as string[];
+
+      expect(required).toContain('id');
     });
   });
 });

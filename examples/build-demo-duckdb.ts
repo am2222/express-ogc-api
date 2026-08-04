@@ -203,10 +203,15 @@ async function main() {
     await db.run('INSTALL spatial; LOAD spatial;');
 
     // --- demo_points ---------------------------------------------------
+    // Sequence-backed id, starting well above the 7 seeded rows below, so a
+    // client-added feature (QGIS's "add feature", which the server now
+    // assigns the id for — see DuckDBProvider.createFeature) never collides
+    // with the seeded data.
     await db.run(`
         CREATE TYPE landmark_category AS ENUM ('entrance', 'venue', 'playground', 'sports');
+        CREATE SEQUENCE demo_points_id_seq START 100;
         CREATE TABLE demo_points (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('demo_points_id_seq'),
             name VARCHAR,
             category landmark_category,
             rating DOUBLE,
@@ -230,10 +235,13 @@ async function main() {
     }
 
     // --- demo_lines ------------------------------------------------------
+    // Same sequence-default treatment as demo_points, started above the 3
+    // seeded rows.
     await db.run(`
         CREATE TYPE surface_kind AS ENUM ('asphalt', 'gravel', 'dirt');
+        CREATE SEQUENCE demo_lines_id_seq START 100;
         CREATE TABLE demo_lines (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('demo_lines_id_seq'),
             name VARCHAR,
             surface surface_kind,
             length_m DOUBLE,
@@ -257,9 +265,13 @@ async function main() {
     }
 
     // --- demo_polygons -----------------------------------------------
+    // Same sequence-default treatment, started above the 3 seeded rows —
+    // this is the table QGIS's "add feature" was captured failing against
+    // (see the module docstring / task report).
     await db.run(`
+        CREATE SEQUENCE demo_polygons_id_seq START 100;
         CREATE TABLE demo_polygons (
-            id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY DEFAULT nextval('demo_polygons_id_seq'),
             name VARCHAR,
             zone_type VARCHAR,
             area_ha DECIMAL(10,2),
