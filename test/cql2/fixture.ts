@@ -21,7 +21,8 @@ export async function createFixture(): Promise<{
 }> {
   const instance = await DuckDBInstance.create(':memory:');
   const db = await instance.connect();
-  await db.run('INSTALL spatial; LOAD spatial;');
+  // Installed once in test/global-setup.ts, so this only has to load it.
+  await db.run('LOAD spatial;');
 
   await db.run(`
     CREATE TABLE places (
