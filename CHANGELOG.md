@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.2.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.1.0...express-ogc-api-v1.2.0) (2026-08-04)
+
+
+### Features
+
+* optimize DuckDB spatial extension loading by installing once in global setup ([34759c5](https://github.com/am2222/express-ogc-api/commit/34759c54a177455ab283caa3bb784a065491fb29))
+* optimize DuckDB spatial extension loading by installing once in… ([33a18cf](https://github.com/am2222/express-ogc-api/commit/33a18cffbd405dd80b25c4d669dced11e579e85b))
+
 ## [1.1.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.0.0...express-ogc-api-v1.1.0) (2026-08-04)
 
 
