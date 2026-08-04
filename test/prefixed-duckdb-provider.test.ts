@@ -24,7 +24,8 @@ function fakeReq(
 
 async function connect(instance: DuckDBInstance): Promise<DuckDBConnection> {
   const conn = await instance.connect();
-  await conn.run('INSTALL spatial; LOAD spatial;');
+  // Installed once in test/global-setup.ts, so this only has to load it.
+  await conn.run('LOAD spatial;');
   return conn;
 }
 

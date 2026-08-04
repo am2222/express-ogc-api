@@ -31,7 +31,8 @@ describe('demo JWT-in-path gate', () => {
   beforeAll(async () => {
     instance = await DuckDBInstance.create(':memory:');
     db = await instance.connect();
-    await db.run('INSTALL spatial; LOAD spatial;');
+    // Installed once in test/global-setup.ts, so this only has to load it.
+    await db.run('LOAD spatial;');
     await db.run(`
       CREATE TABLE demo_cities (id INTEGER PRIMARY KEY, name VARCHAR);
       INSERT INTO demo_cities VALUES (1, 'Demo City');
@@ -60,8 +61,12 @@ describe('demo JWT-in-path gate', () => {
   });
 
   afterAll(async () => {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    db.disconnectSync();
+    // Guarded because `beforeAll` may have thrown before assigning these. An
+    // unguarded teardown reports its own `Cannot read properties of undefined`
+    // on top of the real setup failure, which buries the error that actually
+    // needs reading.
+    if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+    db?.disconnectSync();
   });
 
   function get(token: string, path = '/collections') {
