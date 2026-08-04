@@ -202,6 +202,20 @@ describe('DuckDBProvider', () => {
         (3, 'Zone C', 'industrial', ST_GeomFromText('POLYGON((4 0, 4 1, 5 1, 5 0, 4 0))'));
     `);
 
+    // A table whose *non*-identifier column also has a database default —
+    // isolates the `readOnly` assertion to "this is the id column with a
+    // default", not "any column with a default". `id` here has no default
+    // of its own (contrast with `seq_polygons` above), so a client is still
+    // required to supply it, while `status` defaults but is an ordinary
+    // writable attribute.
+    await db.run(`
+      CREATE TABLE defaulted_status (
+        id INTEGER PRIMARY KEY,
+        status VARCHAR DEFAULT 'active'
+      );
+      INSERT INTO defaulted_status (id, status) VALUES (1, 'active');
+    `);
+
     provider = new DuckDBProvider({ name: 'DuckDBProvider' });
   });
 
@@ -1598,9 +1612,9 @@ describe('DuckDBProvider', () => {
       expect(second?.properties.name).toBe('Second');
     });
 
-    it('a sequence-defaulted id column is still x-ogc-role: id, but is no longer listed as required', async () => {
+    it('a sequence-defaulted id column is still x-ogc-role: id, but is no longer listed as required, and IS readOnly', async () => {
       const schema = await provider.getSchema(fakeReq(db), 'seq_polygons');
-      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string }>;
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string; readOnly?: boolean }>;
       const required = schema.required as string[];
 
       // Still identified as the id column — this is metadata about what the
@@ -1616,13 +1630,45 @@ describe('DuckDBProvider', () => {
       // Other NOT NULL-by-virtue-of-being-a-column-that-happens-to-have-data
       // constraints are unaffected — this table has no other NOT NULL
       // column, so nothing else to assert here beyond "id" being absent.
+
+      // The new assertion: the server silently discards a client-supplied
+      // id here (see `createFeature`'s use of `idColumnWithDefault`), so
+      // Part 5's `readOnly` must say so — this is exactly what tells QGIS's
+      // schema parser to grey the field out instead of letting a user type
+      // an id that collides with an existing row.
+      expect(properties.id.readOnly).toBe(true);
     });
 
-    it('an id column WITHOUT a default is still listed as required (unchanged) — contrast with the sequence-backed case above', async () => {
+    it('an id column WITHOUT a default is still listed as required (unchanged), and is NOT readOnly — contrast with the sequence-backed case above', async () => {
       // `qgis_polygons.id` has no column default at all.
       const schema = await provider.getSchema(fakeReq(db), 'qgis_polygons');
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string; readOnly?: boolean }>;
       const required = schema.required as string[];
 
+      expect(required).toContain('id');
+      // The server cannot assign a value here, so the client is required to
+      // supply one — marking it readOnly would tell a well-behaved client
+      // not to send the one value that makes create work. `x-ogc-role: 'id'`
+      // is unaffected by the absence of a default.
+      expect(properties.id['x-ogc-role']).toBe('id');
+      expect(properties.id.readOnly).toBeUndefined();
+    });
+
+    it('a non-identifier column with a database default is never marked readOnly — readOnly tracks the id column specifically, not "has a default"', async () => {
+      const schema = await provider.getSchema(fakeReq(db), 'defaulted_status');
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string; readOnly?: boolean }>;
+      const required = schema.required as string[];
+
+      // `status` defaults but is an ordinary writable attribute: not the id,
+      // so no `x-ogc-role` and no `readOnly`, regardless of its default.
+      expect(properties.status['x-ogc-role']).toBeUndefined();
+      expect(properties.status.readOnly).toBeUndefined();
+
+      // `id` here has no default at all, so it stays required and is not
+      // readOnly — same shape as the `qgis_polygons` case above, just
+      // co-located with a defaulted non-id column in the same table.
+      expect(properties.id['x-ogc-role']).toBe('id');
+      expect(properties.id.readOnly).toBeUndefined();
       expect(required).toContain('id');
     });
   });

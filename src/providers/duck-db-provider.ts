@@ -758,9 +758,20 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * `column_index`, and `character_maximum_length`), so one query replaces
      * what used to need a join.
      *
-     * Deliberately not emitted: `readOnly`. No column in a plain DuckDB
-     * table is read-only, so there is nothing truthful to put there —
-     * inventing a value would be fabrication, not metadata.
+     * `readOnly: true` is emitted on the id column, but only when
+     * `idColumnWithDefault` (the same predicate `createFeature` uses to
+     * decide whether to omit a client-supplied id from its INSERT) says the
+     * column has a database default. That is exactly when the server — not
+     * the client — assigns the value on create: OGC API - Features Part 4
+     * says the feature id is server-assigned and read-only, and Part 5's
+     * `readOnly` is what QGIS's schema parser reads to grey the field out in
+     * its create form. An id column with no default gets no `readOnly`
+     * (and stays in `required`, see below): the server can't invent an id
+     * for it, so the client still has to supply one, and marking it
+     * read-only would tell a well-behaved client not to send the one value
+     * that makes create work. Kept in sync with `required` deliberately —
+     * the same column can never be both `readOnly` and `required`, since a
+     * client could satisfy neither.
      *
      * This adds one extra query beyond the previous version — `geometryFormat`'s
      * `SELECT DISTINCT ST_GeometryType(...)` scan of the geometry column,
@@ -861,6 +872,14 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
                 property.format = geometryFormat;
             } else if (idColumn && columnName === idColumn) {
                 property['x-ogc-role'] = 'id';
+                // Same predicate `createFeature` uses to decide whether the
+                // database will assign this column's value on INSERT (see
+                // `idColumnWithDefault`) — a field the server silently
+                // discards a client-supplied value for must be advertised
+                // `readOnly`, and the two must never drift apart.
+                if (columnName === assignedIdColumn) {
+                    property.readOnly = true;
+                }
             }
 
             properties[columnName] = property;
