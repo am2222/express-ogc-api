@@ -145,8 +145,11 @@ export interface Queryable extends JSONSchema7 {
  * The schema of one property within a `CollectionSchema` (Part 5). Covers the
  * keywords the two bundled providers actually emit — plain JSON Schema
  * keywords (`type`, `format`, `title`, `enum`, `maxLength`, `contentEncoding`,
- * `description`) plus the two `x-ogc-*` extensions QGIS's OGC API - Features
- * provider parses (`x-ogc-role`, `x-ogc-propertySeq`). The index signature
+ * `description`, `readOnly`) plus the two `x-ogc-*` extensions QGIS's OGC API
+ * - Features provider parses (`x-ogc-role`, `x-ogc-propertySeq`). QGIS's
+ * schema parser also reads plain `readOnly` — set `true` on a property the
+ * server assigns and the client must never supply (e.g. a sequence-backed
+ * identifier column; see `DuckDBProvider.getSchema`). The index signature
  * keeps this open to any other JSON Schema keyword a provider wants to add,
  * since JSON Schema itself is not a closed vocabulary.
  */
@@ -158,6 +161,7 @@ export interface CollectionSchemaProperty {
   enum?: unknown[];
   maxLength?: number;
   contentEncoding?: string;
+  readOnly?: boolean;
   'x-ogc-role'?: string;
   'x-ogc-propertySeq'?: number;
   [key: string]: unknown;

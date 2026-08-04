@@ -47,6 +47,12 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     public override readonly enableTransactions = true;
 
     /**
+     * Cap on how many ENUM members `invalidPropertyValueMessage` lists in a
+     * 400 body. See that method's docstring for why 20.
+     */
+    private static readonly MAX_ENUM_VALUES_IN_MESSAGE = 20;
+
+    /**
      * Per-request memo of the full collection list (`getCollections`), keyed by
      * `req.res`. A WeakMap means entries are garbage-collected along with the
      * response — nothing outlives the request that created it, and there is no
@@ -758,9 +764,20 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * `column_index`, and `character_maximum_length`), so one query replaces
      * what used to need a join.
      *
-     * Deliberately not emitted: `readOnly`. No column in a plain DuckDB
-     * table is read-only, so there is nothing truthful to put there —
-     * inventing a value would be fabrication, not metadata.
+     * `readOnly: true` is emitted on the id column, but only when
+     * `idColumnWithDefault` (the same predicate `createFeature` uses to
+     * decide whether to omit a client-supplied id from its INSERT) says the
+     * column has a database default. That is exactly when the server — not
+     * the client — assigns the value on create: OGC API - Features Part 4
+     * says the feature id is server-assigned and read-only, and Part 5's
+     * `readOnly` is what QGIS's schema parser reads to grey the field out in
+     * its create form. An id column with no default gets no `readOnly`
+     * (and stays in `required`, see below): the server can't invent an id
+     * for it, so the client still has to supply one, and marking it
+     * read-only would tell a well-behaved client not to send the one value
+     * that makes create work. Kept in sync with `required` deliberately —
+     * the same column can never be both `readOnly` and `required`, since a
+     * client could satisfy neither.
      *
      * This adds one extra query beyond the previous version — `geometryFormat`'s
      * `SELECT DISTINCT ST_GeometryType(...)` scan of the geometry column,
@@ -861,6 +878,14 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
                 property.format = geometryFormat;
             } else if (idColumn && columnName === idColumn) {
                 property['x-ogc-role'] = 'id';
+                // Same predicate `createFeature` uses to decide whether the
+                // database will assign this column's value on INSERT (see
+                // `idColumnWithDefault`) — a field the server silently
+                // discards a client-supplied value for must be advertised
+                // `readOnly`, and the two must never drift apart.
+                if (columnName === assignedIdColumn) {
+                    property.readOnly = true;
+                }
             }
 
             properties[columnName] = property;
@@ -1211,7 +1236,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         try {
             reader = await db.runAndReadAll(query, values);
         } catch (err) {
-            throw this.translateWriteError(err, properties);
+            throw await this.translateWriteError(err, properties, db, tableName);
         }
         const row = reader.getRowObjectsJS()[0];
 
@@ -1268,7 +1293,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         try {
             await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
         } catch (err) {
-            throw this.translateWriteError(err, properties);
+            throw await this.translateWriteError(err, properties, db, tableName);
         }
 
         return await this.getFeature(req, collectionId, featureId);
@@ -1313,7 +1338,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         try {
             await db.run(query, [...values, ...idCols.map(() => featureId)] as DuckDBValue[]);
         } catch (err) {
-            throw this.translateWriteError(err, updates);
+            throw await this.translateWriteError(err, updates, db, tableName);
         }
 
         return await this.getFeature(req, collectionId, featureId);
@@ -1330,7 +1355,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         try {
             result = await db.run(query, idCols.map(() => featureId));
         } catch (err) {
-            throw this.translateWriteError(err, {});
+            throw await this.translateWriteError(err, {}, db, tableName);
         }
 
         return result.rowsChanged > 0;
@@ -1368,8 +1393,19 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      *   callers already resolve unknown collections before most write calls,
      *   and an unrecognised error shape should keep failing loudly as a 500
      *   rather than being silently mis-classified.
+     *
+     * `db`/`tableName` are only needed for the `Conversion Error` branch,
+     * to look up whether the offending column is an `ENUM` (see
+     * `enumValuesForColumn`) so its permitted values can be listed in the
+     * message. Every call site already has both in scope, so they're taken
+     * unconditionally rather than threading an optional pair through.
      */
-    private translateWriteError(err: unknown, properties: Record<string, unknown>): unknown {
+    private async translateWriteError(
+        err: unknown,
+        properties: Record<string, unknown>,
+        db: DuckDBConnection,
+        tableName: string
+    ): Promise<unknown> {
         if (!(err instanceof Error)) {
             return err;
         }
@@ -1379,9 +1415,16 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         if (conversionMatch) {
             const rawValue = conversionMatch[1]!.replace(/''/g, "'");
             const property = this.findPropertyByValue(properties, rawValue);
+            // DuckDB's own message can't tell an ENUM rejection from any
+            // other conversion failure — both render as `Could not convert
+            // string '<value>' to <physical-storage-type>` (e.g. `UINT8` for
+            // a small ENUM, `INT32` for an INTEGER; see the class docstring
+            // above `parseEnumValues`). Only a schema lookup on the
+            // identified column tells us which case this is.
+            const enumValues = property ? await this.enumValuesForColumn(db, tableName, property) : undefined;
             return new FeatureValidationError(
                 property
-                    ? `Property "${property}" has a value that is not valid for its column.`
+                    ? this.invalidPropertyValueMessage(property, enumValues)
                     : 'A property value in the request could not be converted to its column type.',
                 { property, status: 400, cause: err }
             );
@@ -1463,6 +1506,63 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     private findPropertyByValue(properties: Record<string, unknown>, rawValue: string): string | undefined {
         const matches = Object.entries(properties).filter(([, value]) => String(value) === rawValue);
         return matches.length === 1 ? matches[0]![0] : undefined;
+    }
+
+    /**
+     * The permitted values for `columnName` if — and only if — it is an
+     * `ENUM` column, for use in a conversion-error message (see
+     * `translateWriteError`). Reads `data_type` for exactly that one column
+     * from `duckdb_columns()` and hands it to `parseEnumValues`, the same
+     * parser `getSchema` uses to build the `enum` array — so the two can
+     * never disagree about what a given `ENUM(...)` rendering means.
+     * Returns `undefined` for a non-ENUM column, and also for a column that
+     * turns out not to exist (defensive: `columnName` came from
+     * `findPropertyByValue` matching the client's request body, not from a
+     * catalog lookup, so it is not guaranteed to name a real column).
+     */
+    private async enumValuesForColumn(
+        db: DuckDBConnection,
+        tableName: string,
+        columnName: string
+    ): Promise<string[] | undefined> {
+        const reader = await db.runAndReadAll(`
+            SELECT data_type
+            FROM duckdb_columns()
+            WHERE database_name = current_database() AND schema_name = current_schema()
+              AND table_name = ? AND column_name = ?
+            `, [tableName, columnName]);
+        const row = reader.getRowObjectsJS()[0];
+        if (!row) {
+            return undefined;
+        }
+        return this.parseEnumValues(String(row['data_type']));
+    }
+
+    /**
+     * The client-facing 400 message for a value that failed to convert into
+     * its column's type. Lists the permitted values only when `enumValues`
+     * is a non-empty array (i.e. the column is a real, populated `ENUM`) —
+     * every other conversion failure (a non-numeric string into an
+     * `INTEGER`, a bad date literal, ...) has no finite values list to offer
+     * and keeps the pre-existing generic wording.
+     *
+     * Capped at `MAX_ENUM_VALUES_IN_MESSAGE` members: an ENUM with a
+     * realistic handful to a couple dozen values (the common case — status
+     * codes, categories, kinds) renders as one readable line, while an ENUM
+     * with hundreds of members (unusual, but not impossible) would otherwise
+     * produce an unusable wall of text and an effectively unbounded response
+     * body. Truncation is called out explicitly (`, and N more`) rather than
+     * silently dropped, so the message never implies a shorter list than the
+     * column actually has.
+     */
+    private invalidPropertyValueMessage(property: string, enumValues: string[] | undefined): string {
+        if (!enumValues || enumValues.length === 0) {
+            return `Property "${property}" has a value that is not valid for its column.`;
+        }
+        const shown = enumValues.slice(0, DuckDBProvider.MAX_ENUM_VALUES_IN_MESSAGE);
+        const remaining = enumValues.length - shown.length;
+        const suffix = remaining > 0 ? `, and ${remaining} more` : '';
+        return `Property "${property}" must be one of: ${shown.join(', ')}${suffix}.`;
     }
 
     addCollection(_collection: Collection): void {

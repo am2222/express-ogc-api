@@ -202,6 +202,20 @@ describe('DuckDBProvider', () => {
         (3, 'Zone C', 'industrial', ST_GeomFromText('POLYGON((4 0, 4 1, 5 1, 5 0, 4 0))'));
     `);
 
+    // A table whose *non*-identifier column also has a database default —
+    // isolates the `readOnly` assertion to "this is the id column with a
+    // default", not "any column with a default". `id` here has no default
+    // of its own (contrast with `seq_polygons` above), so a client is still
+    // required to supply it, while `status` defaults but is an ordinary
+    // writable attribute.
+    await db.run(`
+      CREATE TABLE defaulted_status (
+        id INTEGER PRIMARY KEY,
+        status VARCHAR DEFAULT 'active'
+      );
+      INSERT INTO defaulted_status (id, status) VALUES (1, 'active');
+    `);
+
     provider = new DuckDBProvider({ name: 'DuckDBProvider' });
   });
 
@@ -636,7 +650,7 @@ describe('DuckDBProvider', () => {
     expect(properties.location.type).toBe('object');
   });
 
-  it('rejects an invalid enum value with a translated error, not the raw DuckDB one', async () => {
+  it('rejects an invalid enum value with a translated error naming the permitted values, not the raw DuckDB one', async () => {
     let caught: unknown;
     try {
       await provider.createFeature(fakeReq(db), 'roads', {
@@ -658,6 +672,14 @@ describe('DuckDBProvider', () => {
     expect(err.message).not.toContain('UINT8');
     expect(err.message).not.toContain('Conversion Error');
     expect(err.message).toContain('surface');
+    // The actionable part: QGIS renders `enum` as a free-text box, so the
+    // permitted values have nowhere else to reach the person typing except
+    // this message.
+    expect(err.message).toBe('Property "surface" must be one of: asphalt, gravel, dirt.');
+    // No SQL or physical-schema vocabulary leaked either.
+    expect(err.message).not.toContain('SELECT');
+    expect(err.message).not.toContain('duckdb_columns');
+    expect(err.message).not.toContain('ENUM(');
     // The original DuckDB error is preserved for server-side logs.
     expect(String((err.cause as Error)?.message)).toContain('UINT8');
   });
@@ -730,9 +752,125 @@ describe('DuckDBProvider', () => {
       expect(res.status).toBe(400);
       expect(JSON.stringify(body)).not.toContain('UINT8');
       expect(body.description).toContain('surface');
+      expect(body.description).toBe('Property "surface" must be one of: asphalt, gravel, dirt.');
     } finally {
       server.close();
     }
+  });
+
+  it('still accepts a valid enum value (no over-eager rejection)', async () => {
+    const created = await provider.createFeature(fakeReq(db), 'roads', {
+      type: 'Feature',
+      id: 950,
+      geometry: null,
+      properties: { id: 950, name: 'Gravel Lane', surface: 'gravel', lane_count: 1 },
+    });
+
+    expect(created?.properties.surface).toBe('gravel');
+
+    expect(await provider.deleteFeature(fakeReq(db), 'roads', '950')).toBe(true);
+  });
+
+  it('does not invent a values list for a non-enum conversion failure (a non-numeric string into an INTEGER column)', async () => {
+    let caught: unknown;
+    try {
+      await provider.createFeature(fakeReq(db), 'roads', {
+        type: 'Feature',
+        id: 951,
+        geometry: null,
+        // `lane_count` is a plain INTEGER — not an ENUM — so there is no
+        // finite values list to offer here. This must keep the pre-existing
+        // generic wording, not gain a bogus "must be one of" list.
+        properties: { id: 951, name: 'Bad Lane Count', surface: 'asphalt', lane_count: 'notanumber' },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.property).toBe('lane_count');
+    expect(err.message).toBe('Property "lane_count" has a value that is not valid for its column.');
+    expect(err.message).not.toContain('must be one of');
+  });
+
+  it('replaceFeature (PUT) also lists permitted enum values, not just createFeature', async () => {
+    let caught: unknown;
+    try {
+      await provider.replaceFeature(fakeReq(db), 'roads', '1', {
+        type: 'Feature',
+        id: 1,
+        geometry: null,
+        properties: { name: 'Main St', surface: 'concrete', lane_count: 2 },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.property).toBe('surface');
+    expect(err.message).toBe('Property "surface" must be one of: asphalt, gravel, dirt.');
+  });
+
+  it('updateFeature (PATCH) also lists permitted enum values, not just createFeature', async () => {
+    let caught: unknown;
+    try {
+      await provider.updateFeature(fakeReq(db), 'roads', '1', {
+        feature: {
+          type: 'Feature',
+          id: 1,
+          geometry: null,
+          properties: { surface: 'concrete' },
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.property).toBe('surface');
+    expect(err.message).toBe('Property "surface" must be one of: asphalt, gravel, dirt.');
+  });
+
+  it('truncates the permitted-values list for an enum with more members than the cap, calling out the truncation', async () => {
+    const members = Array.from({ length: 25 }, (_, i) => `v${i + 1}`);
+    const enumLiteral = members.map((m) => `'${m}'`).join(', ');
+    await db.run(`
+      CREATE TYPE big_enum_kind AS ENUM (${enumLiteral});
+      CREATE TABLE big_enum_table (id INTEGER PRIMARY KEY, kind big_enum_kind);
+    `);
+
+    let caught: unknown;
+    try {
+      await provider.createFeature(fakeReq(db), 'big_enum_table', {
+        type: 'Feature',
+        id: 1,
+        geometry: null,
+        properties: { id: 1, kind: 'not-a-member' },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(FeatureValidationError);
+    const err = caught as FeatureValidationError;
+    expect(err.status).toBe(400);
+    expect(err.property).toBe('kind');
+
+    // The first 20 (the cap) are named individually...
+    for (const member of members.slice(0, 20)) {
+      expect(err.message).toContain(member);
+    }
+    // ...but the list stops there, and says so explicitly, rather than
+    // silently under-reporting a 25-member enum as a 20-member one.
+    expect(err.message).toContain(', and 5 more.');
+    expect(err.message).not.toContain('v21');
+    expect(err.message).not.toContain('v25');
   });
 
   it('creates, updates and deletes a feature', async () => {
@@ -1598,9 +1736,9 @@ describe('DuckDBProvider', () => {
       expect(second?.properties.name).toBe('Second');
     });
 
-    it('a sequence-defaulted id column is still x-ogc-role: id, but is no longer listed as required', async () => {
+    it('a sequence-defaulted id column is still x-ogc-role: id, but is no longer listed as required, and IS readOnly', async () => {
       const schema = await provider.getSchema(fakeReq(db), 'seq_polygons');
-      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string }>;
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string; readOnly?: boolean }>;
       const required = schema.required as string[];
 
       // Still identified as the id column — this is metadata about what the
@@ -1616,13 +1754,45 @@ describe('DuckDBProvider', () => {
       // Other NOT NULL-by-virtue-of-being-a-column-that-happens-to-have-data
       // constraints are unaffected — this table has no other NOT NULL
       // column, so nothing else to assert here beyond "id" being absent.
+
+      // The new assertion: the server silently discards a client-supplied
+      // id here (see `createFeature`'s use of `idColumnWithDefault`), so
+      // Part 5's `readOnly` must say so — this is exactly what tells QGIS's
+      // schema parser to grey the field out instead of letting a user type
+      // an id that collides with an existing row.
+      expect(properties.id.readOnly).toBe(true);
     });
 
-    it('an id column WITHOUT a default is still listed as required (unchanged) — contrast with the sequence-backed case above', async () => {
+    it('an id column WITHOUT a default is still listed as required (unchanged), and is NOT readOnly — contrast with the sequence-backed case above', async () => {
       // `qgis_polygons.id` has no column default at all.
       const schema = await provider.getSchema(fakeReq(db), 'qgis_polygons');
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string; readOnly?: boolean }>;
       const required = schema.required as string[];
 
+      expect(required).toContain('id');
+      // The server cannot assign a value here, so the client is required to
+      // supply one — marking it readOnly would tell a well-behaved client
+      // not to send the one value that makes create work. `x-ogc-role: 'id'`
+      // is unaffected by the absence of a default.
+      expect(properties.id['x-ogc-role']).toBe('id');
+      expect(properties.id.readOnly).toBeUndefined();
+    });
+
+    it('a non-identifier column with a database default is never marked readOnly — readOnly tracks the id column specifically, not "has a default"', async () => {
+      const schema = await provider.getSchema(fakeReq(db), 'defaulted_status');
+      const properties = schema.properties as Record<string, { 'x-ogc-role'?: string; readOnly?: boolean }>;
+      const required = schema.required as string[];
+
+      // `status` defaults but is an ordinary writable attribute: not the id,
+      // so no `x-ogc-role` and no `readOnly`, regardless of its default.
+      expect(properties.status['x-ogc-role']).toBeUndefined();
+      expect(properties.status.readOnly).toBeUndefined();
+
+      // `id` here has no default at all, so it stays required and is not
+      // readOnly — same shape as the `qgis_polygons` case above, just
+      // co-located with a defaulted non-id column in the same table.
+      expect(properties.id['x-ogc-role']).toBe('id');
+      expect(properties.id.readOnly).toBeUndefined();
       expect(required).toContain('id');
     });
   });
