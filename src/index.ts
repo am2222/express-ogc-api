@@ -12,11 +12,10 @@ import CollectionHandler from '@/handlers/collections';
 export class OGCAPI {
   router: Router;
   options: OGCFeaturesConfig = {};
-  provider: BaseProvider;
+  provider: BaseProvider<any, any>;
   app: Application;
 
-  constructor(provider: BaseProvider, app: Application, options: OGCFeaturesConfig = {}) {
-    this.router = Router();
+  constructor(provider: BaseProvider<any, any>, app: Application, options: OGCFeaturesConfig = {}) {
     this.provider = provider;
     this.options = options;
     this.app = app;
@@ -25,18 +24,38 @@ export class OGCAPI {
       throw new Error('Provider is required to initialize OGCAPI');
     }
 
-    this.router = Router();
+    this.router = Router({ mergeParams: true });
     this.setup();
   }
 
-  setup() {
+  private hasJsonParser(): boolean {
+    // Express 5 exposes `app.router`; Express 4 exposes the private `_router`,
+    // which is undefined until the first middleware is registered.
+    let router: any;
+    try {
+      router = (this.app as any).router;
+    } catch {
+      // Express 4 throws when accessing .router; fall back to _router
+      router = (this.app as any)._router;
+    }
+    if (!router) {
+      router = (this.app as any)._router;
+    }
+    if (!router?.stack) {
+      return false;
+    }
+    return router.stack.some(
+      (layer: { name?: string }) => layer?.name === 'jsonParser'
+    );
+  }
 
-    if (this.app && !this.app._router?.stack.some((layer: { name: string; }) => layer?.name === 'json')) {
-      this.app.use(express.json({ type: ['application/json', 'application/geo+json'] }));
-      console.log('Dynamically added JSON body parser to app');
+  setup() {
+    if (this.app && !this.hasJsonParser()) {
+      this.app.use(
+        express.json({ type: ['application/json', 'application/geo+json'] })
+      );
     }
 
-    this.provider.setupProviderHooks(this.router);
     const root = new RootHandler(this.provider, this.options);
 
     if (!root.isProviderConformed()) {
@@ -76,7 +95,21 @@ export class OGCAPI {
 export default OGCAPI;
 export { InMemoryProvider } from '@/providers/in-memory-provider';
 export { BaseProvider } from '@/providers/base-provider';
-export type { OGCFeaturesConfig,Feature } from '@/types';
+export type { OGCFeaturesConfig, Feature, ProviderRequest, QueryParams, Collection, CollectionSchema, CollectionSchemaProperty, FeatureCollection, Queryable, UpdateFeatureParams } from '@/types';
 export { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
+export type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 export { DuckDBProvider } from '@/providers/duck-db-provider';
-export type { DuckDBProviderDef } from '@/providers/duck-db-provider';
+export type { DuckDBProviderDef, DuckDBLocals } from '@/providers/duck-db-provider';
+
+export { FeatureValidationError } from '@/errors';
+export type { FeatureValidationErrorStatus, FeatureValidationErrorOptions } from '@/errors';
+
+// CQL2 -> SQL translation. Usable standalone, with any provider.
+export { Cql2ToSql, duckdbPatches, SUPPORTED_OPS, Cql2Error } from '@/cql2';
+export type {
+  Cql2ToSqlOptions,
+  Cql2ErrorCode,
+  FilterLang,
+  Sql,
+  SqlPatch,
+} from '@/cql2';

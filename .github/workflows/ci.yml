@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here needs write access.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Matches `engines.node` (>=20). Node 18 is EOL and is not tested.
+        node-version: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The build is only useful if the emitted package actually imports. `tsc`
+      # leaves the `@/*` path alias unresolved and omits ESM file extensions, so
+      # a green typecheck does not imply a loadable package — importing the real
+      # artifact is what catches that.
+      - name: Verify built package is importable
+        run: |
+          node --input-type=module -e "
+          import OGCAPI, { InMemoryProvider, BaseProvider, DuckDBProvider } from './dist/index.js';
+          for (const [name, v] of Object.entries({ OGCAPI, InMemoryProvider, BaseProvider, DuckDBProvider })) {
+            if (typeof v !== 'function') throw new Error(name + ' did not load: ' + typeof v);
+          }
+          console.log('dist/index.js imports cleanly');
+          "

@@ -1,7 +1,7 @@
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 
-import type { Collections, Link } from '@/types';
+import type { Collections, Link, ProviderRequest } from '@/types';
 import type { NextFunction, Request, Response, Router } from 'express';
 
 export class CollectionHandler extends BaseHandler {
@@ -17,7 +17,7 @@ export class CollectionHandler extends BaseHandler {
     next: NextFunction
   ): Promise<void> {
     try {
-      const collections = await this.provider.getCollections();
+      const collections = await this.provider.getCollections(req as ProviderRequest);
 
       const response: Collections = {
         links: [
@@ -86,7 +86,10 @@ export class CollectionHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
 
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');

@@ -6,12 +6,12 @@ import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 import type { Exception, OGCFeaturesConfig } from '@/types';
 
 export class BaseHandler {
-  provider: BaseProvider;
+  provider: BaseProvider<any, any>;
   requiredCoreClasses: OGCAPIConformanceItem[] = [];
-  basePath: string = '/';
+  basePath?: string;
   options: OGCFeaturesConfig = {};
 
-  constructor(provider: BaseProvider, options: OGCFeaturesConfig = {}) {
+  constructor(provider: BaseProvider<any, any>, options: OGCFeaturesConfig = {}) {
     this.provider = provider;
     this.options = options;
     if (options.basePath) {
@@ -36,12 +36,6 @@ export class BaseHandler {
     next();
   }
 
-  preProviderHook(req: Request, res: Response, next: NextFunction): void {
-    // Hook to run before provider methods
-    this.provider.preProviderHook(req, res);
-    next();
-  }
-
   isProviderConformed(): boolean {
     if (!this.provider) {
       return false;
@@ -55,6 +49,17 @@ export class BaseHandler {
     );
   }
 
+  /**
+   * The URL prefix for generated links: the configured `basePath` when set,
+   * otherwise the mount path Express resolved for this request. `req.baseUrl`
+   * already has route params substituted, so a router mounted at
+   * `/root/:dbid` yields `/root/db1`.
+   */
+  protected resolvePrefix(req: Request): string {
+    const prefix = this.basePath ?? req.baseUrl ?? '';
+    return prefix.replace(/\/+$/, '');
+  }
+
   buildUrl(
     req: Request,
     path: string,
@@ -63,7 +68,7 @@ export class BaseHandler {
   ): string {
     const protocol = req.protocol;
     const host = req.get('host');
-    const basePath = this.basePath.replace(/\/+$/, '');
+    const basePath = this.resolvePrefix(req);
     const baseUrl = `${protocol}://${host}${basePath}${path}`;
 
     // Determine which query parameters to use

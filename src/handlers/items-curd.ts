@@ -1,7 +1,9 @@
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
+import { FeatureValidationError } from '@/errors';
+import { Cql2Error } from '@/cql2';
 
-import type { FeatureCollection, Link, QueryParams } from '@/types';
+import type { FeatureCollection, Link, ProviderRequest, QueryParams } from '@/types';
 import type { NextFunction, Request, Response, Router } from 'express';
 
 export class ItemsCURDHandler extends BaseHandler {
@@ -90,6 +92,57 @@ export class ItemsCURDHandler extends BaseHandler {
     return params;
   }
 
+  /**
+   * Shared catch handling for the write endpoints (Part 4). A
+   * `FeatureValidationError` means the database rejected the write for a
+   * reason that's the client's fault — respond with the status it carries
+   * (400, or 409 for a uniqueness conflict) via the existing `sendError`
+   * helper. Anything else is a genuine server fault and still goes to
+   * `next(err)`, same as before.
+   */
+  private handleWriteError(res: Response, next: NextFunction, err: unknown): void {
+    if (err instanceof FeatureValidationError) {
+      this.sendError(res, err.status, err.message);
+      return;
+    }
+    next(err);
+  }
+
+  /**
+   * Wrap a `Cql2Error` — thrown by `Cql2ToSql`/a provider's `getFeatures`
+   * when a `filter` query parameter is malformed (`PARSE_ERROR`), uses an
+   * operation the translator doesn't support (`UNSUPPORTED_OP`), or names a
+   * property outside the collection's queryables (`UNKNOWN_PROPERTY`) — into
+   * a `FeatureValidationError`. The CQL2 module's own contract is that all
+   * three codes are the client's fault and map to 400; anything else
+   * escaping the translator is a bug and must keep 500ing.
+   *
+   * The `code` and the translator's `detail` (typically the offending
+   * property or operation name) are folded into the message: the entire
+   * point of responding 400 here is that the client can tell what was wrong
+   * with the filter, not just that something was.
+   */
+  private wrapCql2Error(err: Cql2Error): FeatureValidationError {
+    const detail = err.detail ? `: ${err.detail}` : '';
+    return new FeatureValidationError(`Invalid filter (${err.code})${detail} — ${err.message}`, {
+      property: err.code === 'UNKNOWN_PROPERTY' ? err.detail : undefined,
+      status: 400,
+      cause: err,
+    });
+  }
+
+  /**
+   * Shared catch handling for the read endpoints (`handleFeatures`,
+   * `handleFeature`). Before this, a `Cql2Error` from a bad `filter` fell
+   * through to `next(err)` and 500ed — the read-path equivalent of the bug
+   * `handleWriteError` already closed for the write endpoints. A
+   * `Cql2Error` is translated to a `FeatureValidationError` and handled the
+   * same way; anything else still goes to `next(err)` unchanged.
+   */
+  private handleReadError(res: Response, next: NextFunction, err: unknown): void {
+    this.handleWriteError(res, next, err instanceof Cql2Error ? this.wrapCql2Error(err) : err);
+  }
+
   private async handleFeatures(
     req: Request,
     res: Response,
@@ -100,6 +153,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const params = this.parseQueryParams(req);
 
       const featureCollection = await this.provider.getFeatures(
+        req as ProviderRequest,
         collectionId,
         params
       );
@@ -168,9 +222,11 @@ export class ItemsCURDHandler extends BaseHandler {
         timeStamp: new Date().toISOString(),
       };
 
-      res.json(response);
+      // OGC API - Features Core requires GeoJSON feature responses to be
+      // served as application/geo+json, and clients content-negotiate on it.
+      res.type('application/geo+json').json(response);
     } catch (err) {
-      next(err);
+      this.handleReadError(res, next, err);
     }
   }
 
@@ -181,23 +237,30 @@ export class ItemsCURDHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId, featureId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
 
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');
         return;
       }
 
-      const feature = await this.provider.getFeature(collectionId, featureId);
+      const feature = await this.provider.getFeature(
+        req as ProviderRequest,
+        collectionId,
+        featureId
+      );
 
       if (!feature) {
         this.sendError(res, 404, 'Feature not found');
         return;
       }
 
-      res.json(feature);
+      res.type('application/geo+json').json(feature);
     } catch (err) {
-      next(err);
+      this.handleReadError(res, next, err);
     }
   }
 
@@ -209,13 +272,19 @@ export class ItemsCURDHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');
         return;
       }
-      const queryables = await this.provider.getQueryables(collectionId);
-      res.json(queryables);
+      const queryables = await this.provider.getQueryables(
+        req as ProviderRequest,
+        collectionId
+      );
+      res.type('application/schema+json').json(queryables);
     } catch (err) {
       next(err);
     }
@@ -229,14 +298,21 @@ export class ItemsCURDHandler extends BaseHandler {
   ): Promise<void> {
     try {
       const { collectionId } = req.params;
-      const collection = await this.provider.getCollection(collectionId);
+      const collection = await this.provider.getCollection(
+        req as ProviderRequest,
+        collectionId
+      );
       if (!collection) {
         this.sendError(res, 404, 'Collection not found');
         return;
       }
       const feature = req.body;
 
-      const created = await this.provider.createFeature(collectionId, feature);
+      const created = await this.provider.createFeature(
+        req as ProviderRequest,
+        collectionId,
+        feature
+      );
 
       if (!created) {
         this.sendError(res, 500, 'Failed to create feature');
@@ -250,7 +326,7 @@ export class ItemsCURDHandler extends BaseHandler {
         )
         .json(created);
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 
@@ -264,6 +340,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const feature = req.body;
 
       const replaced = await this.provider.replaceFeature(
+        req as ProviderRequest,
         collectionId,
         featureId,
         feature
@@ -276,7 +353,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.status(204).send();
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 
@@ -290,6 +367,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const updates = req.body;
 
       const updated = await this.provider.updateFeature(
+        req as ProviderRequest,
         collectionId,
         featureId,
         { feature: updates }
@@ -302,7 +380,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.status(204).send();
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 
@@ -315,6 +393,7 @@ export class ItemsCURDHandler extends BaseHandler {
       const { collectionId, featureId } = req.params;
 
       const deleted = await this.provider.deleteFeature(
+        req as ProviderRequest,
         collectionId,
         featureId
       );
@@ -326,7 +405,7 @@ export class ItemsCURDHandler extends BaseHandler {
 
       res.status(204).send();
     } catch (err) {
-      next(err);
+      this.handleWriteError(res, next, err);
     }
   }
 

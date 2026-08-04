@@ -1,24 +1,57 @@
 // biome-ignore assist/source/organizeImports: <explanation>
 import type {
   Collection,
+  CollectionSchema,
   Feature,
   FeatureCollection,
+  ProviderRequest,
   Queryable,
   QueryParams,
   UpdateFeatureParams,
 } from '@/types';
-import type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
-import type { NextFunction, Router, Request, Response } from 'express';
+import { OGCAPIConformanceClass, type OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 
 export interface ProviderDef {
   name: string;
 }
 
-export abstract class BaseProvider {
+export abstract class BaseProvider<
+  TParams extends Record<string, string> = Record<string, string>,
+  TLocals extends Record<string, any> = Record<string, any>,
+> {
   public name: string;
 
+  /**
+   * Declares that this provider's `getSchema` is genuinely implemented.
+   * Setting this to `true` activates `GET /collections/{id}/schema` (see
+   * `SchemaHandler.isProviderConformed`) and folds the Part 5 "Schemas"
+   * conformance class into `conformanceClasses()` (via
+   * `schemaConformanceClasses()`). Must be declared explicitly by every
+   * concrete subclass that supports it — see "Migrating" in the README for
+   * why this can no longer be detected automatically.
+   */
   public readonly enableSchemas: boolean = false;
+
+  /**
+   * Declares that this provider's `getFeatures`/`getQueryables` genuinely
+   * support filtering. Setting this to `true` activates
+   * `GET /collections/{id}/queryables` and makes the `filter` and
+   * `filter-lang` query parameters live in `ItemsCURDHandler.parseQueryParams`
+   * (otherwise they are silently ignored). Must be declared explicitly by
+   * every concrete subclass that supports it.
+   */
   public readonly enableFiltering: boolean = false;
+
+  /**
+   * Declares that this provider performs CRS transformation rather than
+   * merely advertising `supportedCrs`/`defaultCrs`. Setting this to `true`
+   * makes the `crs`, `bbox-crs` and `filter-crs` query parameters live in
+   * `ItemsCURDHandler.parseQueryParams`, and turns on `crs`/`storageCrs` in
+   * collection responses (`CollectionHandler`). Leaving it `false` when a
+   * provider doesn't actually transform CRS keeps those parameters honestly
+   * inert instead of accepted-but-ignored. Must be declared explicitly by
+   * every concrete subclass that supports it.
+   */
   public readonly enableCrs: boolean = false;
 
   public readonly supportedCrs: string[] = [
@@ -36,6 +69,15 @@ export abstract class BaseProvider {
 
   public readonly defaultIdFormat: string = 'string';
 
+  /**
+   * Declares that this provider's `createFeature`/`replaceFeature`/
+   * `updateFeature`/`deleteFeature` are genuinely implemented. Setting this
+   * to `true` activates the write endpoints (`POST`/`PUT`/`PATCH`/`DELETE`
+   * on `/collections/{id}/items[/{featureId}]`, see
+   * `ItemsCURDHandler.setupRoutes`) and advertises them in the `OPTIONS`
+   * `Allow` header (`RootHandler.handleOptionsRequests`). Must be declared
+   * explicitly by every concrete subclass that supports it.
+   */
   public readonly enableTransactions: boolean = false;
   public readonly defaultLimit: number = 100;
 
@@ -47,110 +89,99 @@ export abstract class BaseProvider {
       throw new TypeError('BaseProvider is abstract; use a concrete subclass');
     }
     this.name = providerDef.name;
+  }
 
-    //check if getSchema is implemented in subclass
-    const proto = Object.getPrototypeOf(this);
-    if (
-      proto.getSchema &&
-      proto.getSchema !== BaseProvider.prototype.getSchema
-    ) {
-      this.enableSchemas = true;
-    } else {
-      this.enableSchemas = false;
-    }
+  /**
+   * The Part 5 "Schemas" conformance class to fold into a subclass's
+   * `conformanceClasses()`, tied to the `enableSchemas` flag this class
+   * already computes (rather than each provider hand-listing the class
+   * literal and letting it drift out of sync with whether `getSchema` is
+   * actually meaningfully implemented). Returns an empty array when
+   * `enableSchemas` is false, so `[...classes, ...this.schemaConformanceClasses()]`
+   * is always safe to spread.
+   */
+  protected schemaConformanceClasses(): OGCAPIConformanceItem[] {
+    return this.enableSchemas ? [OGCAPIConformanceClass.FEATURES_SCHEMAS] : [];
+  }
 
-    //check if crs handling is implemented in subclass
-    if (
-      proto.getFeatures &&
-      proto.getFeatures !== BaseProvider.prototype.getFeatures
-    ) {
-      this.enableFiltering = true;
-    } else {
-      this.enableFiltering = false;
-    }
-
-    // check if transactions are enabled
-    if (
-      proto.createFeature &&
-      proto.createFeature !== BaseProvider.prototype.createFeature &&
-      proto.updateFeature &&
-      proto.updateFeature !== BaseProvider.prototype.updateFeature &&
-      proto.deleteFeature &&
-      proto.deleteFeature !== BaseProvider.prototype.deleteFeature
-    ) {
-      this.enableTransactions = true;
-    } else {
-      this.enableTransactions = false;
-    }
+  /**
+   * Derive a human-readable field alias from a column/property name for the
+   * `title` schema keyword (QGIS uses this as the field's alias in its
+   * attribute table). Kept deliberately simple and predictable: split on
+   * `_`/`-`, capitalize the first letter of each resulting word, and join
+   * with a space — no acronym handling, no camelCase splitting.
+   * `founded_year` -> `Founded Year`; `id` -> `Id`.
+   */
+  protected titleFromColumnName(name: string): string {
+    return name
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
   }
 
   abstract getSchema(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string
-  ): Promise<Record<string, unknown>> | Record<string, unknown>;
+  ): Promise<CollectionSchema> | CollectionSchema;
 
   abstract createFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     feature: Feature
   ): Promise<Feature | null>;
+
   abstract replaceFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string,
     feature: Feature
   ): Promise<Feature | null>;
+
   abstract updateFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string,
     params: UpdateFeatureParams
   ): Promise<Feature | null>;
+
   abstract deleteFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string
   ): Promise<boolean>;
 
   abstract conformanceClasses(): OGCAPIConformanceItem[];
 
-  abstract getCollections(): Promise<Collection[]> | Collection[];
+  abstract getCollections(
+    req: ProviderRequest<TParams, TLocals>
+  ): Promise<Collection[]> | Collection[];
+
   abstract getCollection(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string
   ): Promise<Collection | null> | Collection | null;
 
   abstract getFeatures(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     params: QueryParams
   ): Promise<FeatureCollection> | FeatureCollection;
+
   abstract getFeature(
+    req: ProviderRequest<TParams, TLocals>,
     collectionId: string,
     featureId: string
-  ): Promise<Feature> | Feature | null;
-  abstract getQueryables(_collectionId: string): Promise<Queryable> | Queryable;
+  ): Promise<Feature | null> | Feature | null;
+
+  abstract getQueryables(
+    req: ProviderRequest<TParams, TLocals>,
+    collectionId: string
+  ): Promise<Queryable> | Queryable;
 
   // Abstract methods for collection management
   abstract addCollection(collection: Collection): void;
   abstract addFeature(collectionId: string, feature: Feature): void;
-
-  preProviderHook(_req: Request, _res: Response): void {
-    console.log('Pre-provider hook executed');
-    return;
-  }
-
-  postProviderHook(_req: Request, _res: Response): void {
-    console.log('Post-provider hook executed');
-    return;
-  }
-
-  setupProviderHooks(router: Router): void {
-    router.use((req: Request, res: Response, next: NextFunction) => {
-      this.preProviderHook(req, res);
-      next();
-    });
-
-    router.use((req: Request, res: Response, next: NextFunction) => {
-      res.on('finish', () => {
-        this.postProviderHook(req, res);
-      });
-      next();
-    });
-  }
 
 }
 

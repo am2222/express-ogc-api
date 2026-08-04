@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+# Grant nothing by default; each job opts into exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Maintains a "chore(main): release x.y.z" PR from Conventional Commit
+  # messages. Merging that PR is what tags the version and cuts the GitHub
+  # release, which in turn sets release_created for the publish job below.
+  release-please:
+    name: release-please
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Publishes via npm Trusted Publishing (OIDC) — no npm token exists anywhere
+  # in this repo. The trusted publisher registered on npmjs.com must name this
+  # file exactly ("release.yml"); renaming this workflow breaks publishing until
+  # the npmjs.com setting is updated to match.
+  publish:
+    name: publish to npm
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Required for npm Trusted Publishing (OIDC) and for build provenance.
+      # This is the only credential involved — there is no npm token to leak.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      # Trusted Publishing requires Node >= 22.14.0; `22` resolves to the
+      # latest 22.x, which satisfies that.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: 'https://registry.npmjs.org'
+
+      # setup-node ships npm 10.x, which predates OIDC publishing. Trusted
+      # Publishing needs >= 11.5.1 to exchange the Actions OIDC token for a
+      # short-lived registry credential. Pin a major here if you'd rather not
+      # track npm's latest.
+      - name: Upgrade npm for Trusted Publishing
+        run: |
+          npm install -g npm@latest
+          node --version
+          npm --version
+
+      - run: npm ci
+
+      # Re-verify on the tagged commit. CI already tested the branch, but the
+      # tag is what actually gets published.
+      - name: Test
+        run: npm test
+
+      # `prepublishOnly` also builds; doing it explicitly means a build failure
+      # is reported as a build failure rather than a publish failure.
+      - name: Build
+        run: npm run build
+
+      # No NODE_AUTH_TOKEN: the OIDC exchange supplies credentials, and
+      # provenance is attached automatically under Trusted Publishing.
+      - name: Publish
+        run: npm publish

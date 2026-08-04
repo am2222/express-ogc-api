@@ -100,7 +100,7 @@ export class RootHandler extends BaseHandler {
     res.send();
   }
   
-  private generateOpenAPISpec(): any {
+  private generateOpenAPISpec(req: Request): any {
     return {
       openapi: '3.0.0',
       info: {
@@ -113,7 +113,7 @@ export class RootHandler extends BaseHandler {
       },
       servers: [
         {
-          url: this.basePath || '/',
+          url: this.resolvePrefix(req) || '/',
           description: 'OGC API - Features Server'
         }
       ],
@@ -401,13 +401,14 @@ export class RootHandler extends BaseHandler {
     // Conformance
     router.get('/conformance', this.handleConformance.bind(this));
     // OPTIONS for root
-    router.options('*', this.handleOptionsRequests.bind(this));
+    // A bare '*' string is rejected by path-to-regexp v8 (Express 5) at route
+    // registration time — i.e. inside the OGCAPI constructor. A RegExp is
+    // accepted by both path-to-regexp v6 (Express 4) and v8 (Express 5).
+    router.options(/.*/, this.handleOptionsRequests.bind(this));
 
-    const swaggerSpec = this.generateOpenAPISpec();
-
-    // Serve OpenAPI JSON
-    router.get('/api', (_req, res) => {
-      res.json(swaggerSpec);
+    // Serve OpenAPI JSON, rebuilt per request so it reflects the mount path
+    router.get('/api', (req, res) => {
+      res.json(this.generateOpenAPISpec(req));
     });
   }
 }

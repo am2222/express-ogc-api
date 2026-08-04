@@ -19,6 +19,9 @@ export enum OGCAPIConformanceClass {
   FEATURES_GMLSF0 = 'http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/gmlsf0',
   FEATURES_GMLSF2 = 'http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/gmlsf2',
 
+  // OGC API - Features - Part 5: Schemas
+  FEATURES_SCHEMAS = 'http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/schemas',
+
   // OGC API - Processes - Part 1: Core
   PROCESSES_CORE = 'http://www.opengis.net/spec/ogcapi-processes-1/1.0/conf/core',
   PROCESSES_OGC_PROCESS_DESCRIPTION = 'http://www.opengis.net/spec/ogcapi-processes-1/1.0/conf/ogc-process-description',

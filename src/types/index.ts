@@ -1,15 +1,32 @@
 import { OGCAPIConformanceClass } from './ogc-confirmance';
+import type { Request, Response } from 'express';
+import type { ParsedQs } from 'qs';
+import type {
+  Feature as GeoJSONFeature,
+  FeatureCollection as GeoJSONFeatureCollection,
+  Geometry,
+} from 'geojson';
+import type { JSONSchema7, JSONSchema7Definition } from 'json-schema';
 
-export interface Feature {
-  type: 'Feature';
+/**
+ * A GeoJSON feature as served by this API.
+ *
+ * Built on `@types/geojson` so `geometry` is a discriminated union rather than
+ * `any` — narrowing on `geometry.type` gives you typed `coordinates`. `null` is
+ * permitted for unlocated features (RFC 7946 §3.2) and is what Part 7's
+ * `skipGeometry` produces.
+ *
+ * Narrows GeoJSON's optional `id` to required: OGC API - Features addresses
+ * every item at `/items/{featureId}`, so a feature we serve always has one.
+ */
+export interface Feature
+  extends GeoJSONFeature<Geometry | null, Record<string, unknown>> {
   id: string | number;
-  geometry: any;
-  properties: Record<string, unknown>;
   links?: Link[];
 }
 
-export interface FeatureCollection {
-  type: 'FeatureCollection';
+export interface FeatureCollection
+  extends GeoJSONFeatureCollection<Geometry | null, Record<string, unknown>> {
   features: Feature[];
   links?: Link[];
   numberMatched?: number;
@@ -110,13 +127,56 @@ export interface UpdateFeatureParams {
   replace?: boolean;
 }
 
-export interface Queryable {
+/**
+ * The queryables schema for a collection (Part 3).
+ *
+ * Extends `JSONSchema7` so nested property schemas are typed instead of
+ * `unknown`; `$id`, `$schema`, `type` and `properties` are narrowed to required
+ * because OGC API - Features mandates all four on this resource.
+ */
+export interface Queryable extends JSONSchema7 {
   $id: string;
   type: 'object';
+  properties: Record<string, JSONSchema7Definition>;
+  $schema: string;
+}
+
+/**
+ * The schema of one property within a `CollectionSchema` (Part 5). Covers the
+ * keywords the two bundled providers actually emit — plain JSON Schema
+ * keywords (`type`, `format`, `title`, `enum`, `maxLength`, `contentEncoding`,
+ * `description`) plus the two `x-ogc-*` extensions QGIS's OGC API - Features
+ * provider parses (`x-ogc-role`, `x-ogc-propertySeq`). The index signature
+ * keeps this open to any other JSON Schema keyword a provider wants to add,
+ * since JSON Schema itself is not a closed vocabulary.
+ */
+export interface CollectionSchemaProperty {
+  type?: string;
+  format?: string;
   title?: string;
   description?: string;
-  properties: Record<string, unknown>;
-  $schema: string;
+  enum?: unknown[];
+  maxLength?: number;
+  contentEncoding?: string;
+  'x-ogc-role'?: string;
+  'x-ogc-propertySeq'?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * The schema a provider's `getSchema` returns (Part 5 "Schemas" resource): a
+ * JSON Schema object describing a collection's item properties. Named
+ * keywords are typed for the ones this library actually populates; the index
+ * signature leaves room for `$id`, vendor extensions, or anything else a
+ * provider wants to add, since JSON Schema is intentionally open — this type
+ * constrains and documents the shape without trying to close it off.
+ */
+export interface CollectionSchema {
+  $schema?: string;
+  type?: string;
+  properties?: Record<string, CollectionSchemaProperty>;
+  required?: string[];
+  [key: string]: unknown;
 }
 
 export interface FunctionMetadata {
@@ -144,6 +204,11 @@ export interface ConformsTo {
 }
 // Configuration export interface
 export interface OGCFeaturesConfig {
+  /**
+   * Optional public prefix override for generated links. Leave unset to follow
+   * the mount path (`req.baseUrl`), which is required when mounting at a
+   * parametrized path such as `/root/:dbid`.
+   */
   basePath?: string;
   title?: string;
   description?: string;
@@ -154,3 +219,17 @@ export interface LandingPage {
   description?: string;
   links: Link[];
 }
+
+/**
+ * The Express request as seen by a provider.
+ *
+ * `res` is declared non-optional: Express assigns the `req.res` back-reference
+ * during dispatch, so it is always present inside a handler-invoked provider
+ * method. Use `req.res.locals` to read whatever your middleware attached.
+ */
+export type ProviderRequest<
+  TParams extends Record<string, string> = Record<string, string>,
+  TLocals extends Record<string, any> = Record<string, any>,
+> = Request<TParams, any, any, ParsedQs, TLocals> & {
+  res: Response<any, TLocals>;
+};
