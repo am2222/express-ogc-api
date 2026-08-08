@@ -458,28 +458,37 @@ uuid()`, then backfill with `UPDATE`.
 
 #### Coordinate reference systems
 
-The authoritative source is the geometry column's own **type**. In spatial 2.x
-`GEOMETRY` is parameterized, so a CRS-carrying column reports
-`GEOMETRY('EPSG:25832')` — the same value `ST_CRS(geom)` returns, but readable
-from `duckdb_columns()` without scanning a row (which on an object-store table
-means no S3 fetch just to answer "what projection is this?").
+The CRS is discovered automatically — you should not normally have to declare
+anything.
 
-**DuckLake currently erases it.** Its catalog stores the column type as a bare
-`geometry`, so a column created as `GEOMETRY('EPSG:25832')` comes back plain and
-`ST_CRS` reads `NULL`. (`ST_SetCRS` doesn't help either: the CRS belongs to the
-column type, not to individual values, so a value inserted into a plain column
-loses it — true in plain DuckDB too.) A **column comment** does persist, as a
-DuckLake column tag, so it is the fallback:
+In spatial 2.x `GEOMETRY` is a parameterized type, so a CRS-carrying column
+reports `GEOMETRY('EPSG:32632')`. DuckLake's *catalog* flattens that to a bare
+`geometry`, which is why `ST_CRS` reads `NULL` through a lake table — but the
+**Parquet files DuckLake writes do record it**, in the native Parquet GEOMETRY
+logical type. So the CRS is read from a data file's schema:
 
 ```sql
-COMMENT ON COLUMN lake.main."<table>".geometry IS 'EPSG:25832';
+-- what the provider effectively does, per table, once
+SELECT data_file FROM ducklake_list_files('lake', '<table>');
+DESCRIBE SELECT geometry FROM read_parquet('<that file>');
+-- column_type -> GEOMETRY('EPSG:32632')
 ```
 
-Resolution order: `crsByCollection` config (an explicit override for
-mislabelled data) → **declared column type** → column comment →
-`defaultStorageCrs`. The result is reported as the collection's `storageCrs`.
-Declare the CRS in the column type wherever it survives; the comment exists for
-DuckLake-backed tables, where today it does not.
+`DESCRIBE` resolves this from the file footer without reading a row, and it
+covers both encodings in the wild: DuckLake writes the native Parquet GEOMETRY
+logical type, while DuckDB's own `COPY` writes GeoParquet 1.0 (a `geo` key in
+the file's key/value metadata). The result is memoised per table, since
+`getCollection` runs before every item read.
+
+Full resolution order:
+
+1. `crsByCollection` config — explicit override for mislabelled data
+2. the geometry column's **declared type** (works where the catalog keeps it)
+3. the **Parquet files' recorded CRS** — the normal path for DuckLake
+4. a geometry column **comment**, e.g. `COMMENT ON COLUMN lake.main."<table>".geometry IS 'EPSG:32632'` — a manual fallback for tables whose rows are still *inlined* in the catalog and have no Parquet file yet
+5. `defaultStorageCrs`
+
+The result is reported as the collection's `storageCrs`.
 
 Once a CRS is known, the provider **reprojects with `ST_Transform` on every read
 and write**, so the API speaks CRS84 lon/lat regardless of how the data is

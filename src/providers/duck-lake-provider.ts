@@ -158,13 +158,15 @@ function assertValidComponent(value: unknown, field: string): asserts value is s
  * - **No uniqueness enforcement.** Nothing stops duplicate ids, so a
  *   client-supplied id is checked for collision in a separate read here
  *   rather than relying on a constraint violation.
- * - **No CRS in the geometry type.** A parameterized `GEOMETRY('EPSG:...')`
- *   column is accepted by DDL and then flattened to plain `GEOMETRY`, and
- *   `ST_SetCRS` does not survive a write/read round trip. A column
- *   *comment* does persist (as a DuckLake column tag), so that is where
- *   this class reads a storage CRS from — and, once known, it reprojects
- *   to and from CRS84 on every read and write. See `rawStorageCrs` and
- *   `geometryTransform`.
+ * - **The catalog loses the CRS, but the data files keep it.** A
+ *   parameterized `GEOMETRY('EPSG:...')` column is accepted by DDL and then
+ *   flattened to plain `GEOMETRY` in the catalog, so `ST_CRS` reads `NULL`
+ *   through the lake table. The Parquet files DuckLake writes do record it,
+ *   in the native Parquet GEOMETRY logical type, so the CRS is recovered
+ *   from a file's schema instead — no annotation required. See
+ *   `parquetGeometryCrs`, `rawStorageCrs`, and `geometryTransform`, which
+ *   reprojects to and from CRS84 on every read and write once the CRS is
+ *   known.
  */
 export class DuckLakeProvider extends DuckDBProvider {
     /**
