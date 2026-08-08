@@ -180,7 +180,7 @@ describe('DuckLakeProvider', () => {
     });
 
     describe('conformance', () => {
-        it('advertises Part 4 (CRUD) and Part 2 (CRS) on top of the base classes', () => {
+        it('advertises Part 4 (CRUD) on top of the base classes', () => {
             const classes = provider.conformanceClasses();
 
             // Without Part 4 a fully write-capable server reads as read-only to
@@ -188,14 +188,31 @@ describe('DuckLakeProvider', () => {
             expect(classes).toContain(OGCAPIConformanceClass.FEATURES_CREATE_REPLACE_DELETE);
             expect(classes).toContain(OGCAPIConformanceClass.FEATURES_UPDATE);
             expect(classes).toContain(OGCAPIConformanceClass.FEATURES_FEATURES);
-            expect(classes).toContain(OGCAPIConformanceClass.FEATURES_CRS);
             expect(classes).toContain(OGCAPIConformanceClass.FEATURES_CORE);
+        });
+
+        it('claims Part 2 (CRS) only in native mode', () => {
+            // Claiming Part 2 while answering in CRS84 invites a client to work
+            // in the storage CRS and then disagree with the CRS84 extent.
+            expect(provider.conformanceClasses()).not.toContain(
+                OGCAPIConformanceClass.FEATURES_CRS
+            );
+            expect(
+                new DuckLakeProvider({ name: 'lake', crsMode: 'native' }).conformanceClasses()
+            ).toContain(OGCAPIConformanceClass.FEATURES_CRS);
         });
     });
 
     describe('storage CRS', () => {
+        // These assert where a CRS is resolved from, which is only observable in
+        // native mode — the default deliberately does not advertise it.
+        let native: DuckLakeProvider;
+        beforeAll(() => {
+            native = new DuckLakeProvider({ name: 'lake', crsMode: 'native' });
+        });
+
         it('reads the CRS from the geometry column comment', async () => {
-            const collection = await provider.getCollection(fakeReq(db, TENANT), 'projected');
+            const collection = await native.getCollection(fakeReq(db, TENANT), 'projected');
 
             expect(collection?.storageCrs).toBe('http://www.opengis.net/def/crs/EPSG/0/25832');
             expect(collection?.crs).toContain('http://www.opengis.net/def/crs/EPSG/0/25832');
@@ -224,11 +241,11 @@ describe('DuckLakeProvider', () => {
                 VALUES ('t1', ST_Point(511224.5191, 5488393.3794));
             `);
 
-            const collection = await provider.getCollection(fakeReq(db, TENANT), 'typed');
+            const collection = await native.getCollection(fakeReq(db, TENANT), 'typed');
             expect(collection?.storageCrs).toBe('http://www.opengis.net/def/crs/EPSG/0/25832');
 
             // And it drives the transform, not just the metadata.
-            const feature = await provider.getFeature(fakeReq(db, TENANT), 'typed', 't1');
+            const feature = await native.getFeature(fakeReq(db, TENANT), 'typed', 't1');
             const coords = (feature?.geometry as { coordinates: number[] }).coordinates;
             expect(coords[0]).toBeCloseTo(9.15517, 4);
             expect(coords[1]).toBeCloseTo(49.54804, 4);
@@ -256,7 +273,7 @@ describe('DuckLakeProvider', () => {
                     return [path];
                 }
             }
-            const stubbed = new StubbedFiles({ name: 'lake' });
+            const stubbed = new StubbedFiles({ name: 'lake', crsMode: 'native' });
 
             await db.run(`
                 CREATE TABLE "GA0gA0DcMF_t5OtsEjChL_7CHCwAJQiO_from_parquet" (
@@ -279,7 +296,7 @@ describe('DuckLakeProvider', () => {
         });
 
         it('omits storageCrs when nothing declares one', async () => {
-            const collection = await provider.getCollection(fakeReq(db, TENANT), 'road_network');
+            const collection = await native.getCollection(fakeReq(db, TENANT), 'road_network');
 
             expect(collection?.storageCrs).toBeUndefined();
         });
@@ -287,6 +304,7 @@ describe('DuckLakeProvider', () => {
         it('lets explicit config win over the column comment', async () => {
             const configured = new DuckLakeProvider({
                 name: 'lake',
+                crsMode: 'native',
                 crsByCollection: { projected: 'EPSG:4326' },
             });
 
@@ -298,6 +316,7 @@ describe('DuckLakeProvider', () => {
         it('applies defaultStorageCrs only where nothing else declares one', async () => {
             const configured = new DuckLakeProvider({
                 name: 'lake',
+                crsMode: 'native',
                 defaultStorageCrs: 'EPSG:3857',
             });
 
@@ -400,6 +419,102 @@ describe('DuckLakeProvider', () => {
             } as never);
 
             expect(result.numberMatched).toBeGreaterThan(0);
+        });
+
+        it('honours ?crs= by returning the storage CRS untransformed', async () => {
+            // Advertising a non-default storageCrs invites a client to work in it
+            // — QGIS adopts it as the layer CRS and asks for it by name. Ignoring
+            // the request and answering in CRS84 anyway puts every feature
+            // thousands of kilometres from where the client plots it: the layer
+            // loads and renders nothing.
+            const req = fakeReq(db, TENANT);
+            (req as { query: Record<string, string> }).query = {
+                crs: 'http://www.opengis.net/def/crs/EPSG/0/25832',
+            };
+
+            const native = new DuckLakeProvider({ name: 'lake', crsMode: 'native' });
+            const feature = await native.getFeature(req, 'projected', 'utm-1');
+            const coords = (feature?.geometry as { coordinates: number[] }).coordinates;
+
+            expect(coords[0]).toBeCloseTo(511224.5191, 3);
+            expect(coords[1]).toBeCloseTo(5488393.3794, 3);
+        });
+
+        it('falls back to CRS84 for a CRS it never advertised', async () => {
+            // A client must not be able to talk the server into emitting a CRS it
+            // does not claim to support.
+            const req = fakeReq(db, TENANT);
+            (req as { query: Record<string, string> }).query = {
+                crs: 'http://www.opengis.net/def/crs/EPSG/0/27700',
+            };
+
+            const feature = await provider.getFeature(req, 'projected', 'utm-1');
+            const coords = (feature?.geometry as { coordinates: number[] }).coordinates;
+
+            expect(coords[0]).toBeCloseTo(LON, 5);
+            expect(coords[1]).toBeCloseTo(LAT, 5);
+        });
+
+        it('interprets bbox in the CRS named by bbox-crs', async () => {
+            // QGIS sends its bbox in the layer CRS. Read as CRS84 degrees, a bbox
+            // in projected metres matches nothing — the other way a layer renders
+            // empty.
+            const req = fakeReq(db, TENANT);
+            (req as { query: Record<string, string> }).query = {
+                'bbox-crs': 'http://www.opengis.net/def/crs/EPSG/0/25832',
+            };
+
+            const native = new DuckLakeProvider({ name: 'lake', crsMode: 'native' });
+            const inside = await native.getFeatures(req, 'projected', {
+                bbox: [511000, 5488000, 511500, 5488700],
+                bboxCrs: 'http://www.opengis.net/def/crs/EPSG/0/25832',
+            } as never);
+
+            expect(inside.numberMatched).toBeGreaterThan(0);
+        });
+
+        it('reports the CRS it actually used via responseCrs', async () => {
+            const native = new DuckLakeProvider({ name: 'lake', crsMode: 'native' });
+
+            const asCrs84 = fakeReq(db, TENANT);
+            expect(await native.responseCrs(asCrs84, 'projected')).toBe(
+                'http://www.opengis.net/def/crs/OGC/1.3/CRS84'
+            );
+
+            const asStorage = fakeReq(db, TENANT);
+            (asStorage as { query: Record<string, string> }).query = {
+                crs: 'http://www.opengis.net/def/crs/EPSG/0/25832',
+            };
+            expect(await native.responseCrs(asStorage, 'projected')).toBe(
+                'http://www.opengis.net/def/crs/EPSG/0/25832'
+            );
+        });
+
+        it('ignores ?crs= in the default crs84 mode, keeping extent and features consistent', async () => {
+            // The whole point of the default: a client cannot end up plotting
+            // features in a CRS the CRS84 extent does not describe.
+            const req = fakeReq(db, TENANT);
+            (req as { query: Record<string, string> }).query = {
+                crs: 'http://www.opengis.net/def/crs/EPSG/0/25832',
+            };
+
+            const feature = await provider.getFeature(req, 'projected', 'utm-1');
+            const coords = (feature?.geometry as { coordinates: number[] }).coordinates;
+            expect(coords[0]).toBeCloseTo(LON, 5);
+            expect(coords[1]).toBeCloseTo(LAT, 5);
+
+            expect(await provider.responseCrs(req, 'projected')).toBe(
+                'http://www.opengis.net/def/crs/OGC/1.3/CRS84'
+            );
+        });
+
+        it('omits storageCrs in crs84 mode but reports it in native mode', async () => {
+            const defaulted = await provider.getCollection(fakeReq(db, TENANT), 'projected');
+            expect(defaulted?.storageCrs).toBeUndefined();
+
+            const native = new DuckLakeProvider({ name: 'lake', crsMode: 'native' });
+            const advertised = await native.getCollection(fakeReq(db, TENANT), 'projected');
+            expect(advertised?.storageCrs).toBe('http://www.opengis.net/def/crs/EPSG/0/25832');
         });
 
         it('leaves a collection with no declared CRS untouched', async () => {

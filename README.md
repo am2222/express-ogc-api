@@ -401,6 +401,40 @@ app.use('/:company/:user/:project', async (req, res, next) => {
 
 A runnable version is `examples/serve-ducklake.ts`.
 
+#### Performance: why the metadata catalog is attached twice
+
+Against a DuckLake catalog, **every metadata lookup is a round trip to the
+catalog database** — measured at roughly 350ms–1.4s each against a remote
+Postgres, and they do not parallelise (a DuckDB connection serialises queries, so
+issuing them concurrently is no faster). The inherited per-table discovery loop
+therefore made `GET /collections` take over a minute for 25 collections, which
+clients time out on.
+
+So `DuckLakeProvider` batches discovery into a fixed handful of queries
+regardless of collection count: one to list tables, one for every geometry column
+and its type, one for every data-file path, and one for every extent. Extents
+come from DuckLake's `ducklake_table_column_stats.extra_stats`, which records a
+bounding box per geometry column, instead of an `ST_Extent_Agg` scan of every
+table's Parquet.
+
+That statistics table is not reachable through the DuckLake attachment, so
+`attachDuckLake` attaches the same catalog a second time as plain read-only
+Postgres, by default as `<alias>_metadata`. Pass `metadataAlias: null` to skip it
+— collections then fall back to scan-based extents, which is correct but slow.
+Tables the statistics don't cover (rows still *inlined* in the catalog, with no
+Parquet file yet) fall back to a scan individually, so an extent is never
+silently dropped.
+
+Two consequences worth knowing:
+
+- A stats-derived extent is **approximate**: the stored bounding box is
+  reprojected by its corners, not by every geometry, so it can differ from a
+  scanned extent by a small margin. OGC allows an approximate extent, and in
+  practice this errs slightly wide rather than narrow.
+- Resolved CRS values are memoised per table for the provider's lifetime. A
+  table's CRS does not change without rewriting its data; restart the process
+  (or pass `crsByCollection`) if it ever does.
+
 #### The connection contract
 
 Beyond `res.locals.db`, this provider needs:

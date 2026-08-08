@@ -136,6 +136,29 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
+     * The transforms to apply for one query: one for the geometry that goes
+     * back to the client, and one each for the CRS the client expressed its
+     * `bbox` and its CQL2 `filter` in. OGC API - Features Part 2 lets those
+     * three be chosen independently (`crs`, `bbox-crs`, `filter-crs`), so they
+     * cannot share a single transform.
+     *
+     * The default keeps all three identical to `geometryTransform`, which is
+     * `undefined` for `DuckDBProvider` — so nothing is reprojected unless a
+     * subclass opts in.
+     */
+    protected async geometryTransforms(
+        req: DuckDBRequest,
+        tableName: string
+    ): Promise<{
+        output?: GeometryTransform;
+        bbox?: GeometryTransform;
+        filter?: GeometryTransform;
+    }> {
+        const transform = await this.geometryTransform(req, tableName);
+        return { output: transform, bbox: transform, filter: transform };
+    }
+
+    /**
      * Wrap a *stored* geometry expression so it comes out in the API's CRS —
      * used for anything the client will see or compare against: GeoJSON
      * output, collection extents, and the geometry side of a spatial
@@ -402,7 +425,11 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         tableName: string,
         geometryColumn: string | undefined,
         params: QueryParams,
-        transform?: GeometryTransform
+        transforms: {
+            output?: GeometryTransform;
+            bbox?: GeometryTransform;
+            filter?: GeometryTransform;
+        } = {}
     ): Promise<Predicate> {
         const clauses: string[] = [];
         const boundParams: DuckDBValue[] = [];
@@ -420,7 +447,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             // `bbox` means exactly what it says, and matches how the CQL2 path
             // below interprets client geometries.
             clauses.push(
-                `ST_Intersects(${this.toApiCrs(this.quote(geometryColumn), transform)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy}))`
+                `ST_Intersects(${this.toApiCrs(this.quote(geometryColumn), transforms.bbox)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy}))`
             );
         }
 
@@ -432,7 +459,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             // (CRS84), so the column they are compared against is reprojected to
             // match.
             const projected = geometryColumn
-                ? this.projectGeometryReferences(sql, geometryColumn, transform)
+                ? this.projectGeometryReferences(sql, geometryColumn, transforms.filter)
                 : sql;
             clauses.push(`(${projected})`);
             boundParams.push(...(filterParams as DuckDBValue[]));
@@ -1278,13 +1305,19 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         // Built once and handed to both this query and `getFeatureCount`, so
         // the features returned and the total reported (`numberMatched`, which
         // drives `next`/`prev` pagination) can never apply different filters.
-        const transform = await this.geometryTransform(req, tableName);
-        const predicate = await this.buildPredicate(db, tableName, geometryColumn, params, transform);
+        const transforms = await this.geometryTransforms(req, tableName);
+        const predicate = await this.buildPredicate(
+            db,
+            tableName,
+            geometryColumn,
+            params,
+            transforms
+        );
 
         let query = `SELECT *, `;
 
         if (geometryColumn) {
-            query += `ST_AsGeoJSON(${this.toApiCrs(this.quote(geometryColumn), transform)}) as __geometry_json `;
+            query += `ST_AsGeoJSON(${this.toApiCrs(this.quote(geometryColumn), transforms.output)}) as __geometry_json `;
         }
 
         query += `FROM ${this.quote(tableName)} `;
@@ -1341,12 +1374,12 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
         const geometryColumn = await this.geometryColumn(db, tableName);
         const { timeColumns, dateColumns } = await this.temporalColumnKinds(db, tableName);
-        const transform = await this.geometryTransform(req, tableName);
+        const { output } = await this.geometryTransforms(req, tableName);
 
         let query = `SELECT *, `;
 
         if (geometryColumn) {
-            query += `ST_AsGeoJSON(${this.toApiCrs(this.quote(geometryColumn), transform)}) as __geometry_json `;
+            query += `ST_AsGeoJSON(${this.toApiCrs(this.quote(geometryColumn), output)}) as __geometry_json `;
         }
 
         const idCols = await this.idColumns(db, tableName);

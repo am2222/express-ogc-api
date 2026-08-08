@@ -74,6 +74,27 @@ const ALIAS = 'lake';
 
 const app = express();
 
+/**
+ * Request log. Worth having on by default for this example: when a GIS client
+ * loads a layer but renders nothing, the cause is almost always visible in what
+ * it asked for — which `crs`/`bbox-crs` it named, and the `bbox` values it sent
+ * — rather than in anything the server logs about itself.
+ */
+app.use((req, res, next) => {
+    const started = Date.now();
+    res.on('finish', () => {
+        const query = Object.keys(req.query).length
+            ? ` ${new URLSearchParams(req.query as Record<string, string>).toString()}`
+            : '';
+        const crs = res.getHeader('Content-Crs');
+        console.log(
+            `${req.method} ${req.path}${query} -> ${res.statusCode}` +
+                `${crs ? ` Content-Crs=${String(crs)}` : ''} (${Date.now() - started}ms)`
+        );
+    });
+    next();
+});
+
 // One instance for the process. DuckDB's ATTACH is instance-wide, so the lake
 // is attached once on a setup connection and every per-request connection
 // inherits it — no Postgres handshake or S3 secret per request.
@@ -135,6 +156,15 @@ const provider = new DuckLakeProvider({
     // `COMMENT ON COLUMN <table>.geometry IS 'EPSG:25832'`.
     defaultStorageCrs: process.env.DATALAKE_STORAGE_CRS,
 });
+
+// Resolve every table's CRS now rather than on the first client request, which
+// would otherwise pay for all of it and may be abandoned before it finishes.
+// Deliberately not awaited: the server can start serving immediately, and a
+// request arriving mid-warm-up just resolves what it needs itself.
+provider
+    .warmUp(setup)
+    .then(() => console.log('✓ CRS cache warmed'))
+    .catch((err) => console.warn('CRS warm-up failed (not fatal):', err));
 
 const ogc = new OGCAPI(provider, app, {
     title: 'DuckLake OGC API - Features',
