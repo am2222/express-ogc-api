@@ -17,6 +17,7 @@ import { OGCAPIConformanceItem, OGCAPIConformanceClass } from '@/types/ogc-confi
 import { BaseProvider, type ProviderDef } from '@/providers/base-provider';
 import { FeatureValidationError } from '@/errors';
 import { Cql2ToSql } from '@/cql2';
+import { crsFromGeometryTypeName } from '@/providers/geometry-crs';
 
 /** A WHERE clause (empty string when there is nothing to filter by) and the
  * values bound to its `?` placeholders, in the order they appear. `filter`
@@ -40,6 +41,33 @@ type DuckDBRequest = ProviderRequest<Record<string, string>, DuckDBLocals>;
 
 /** Shared empty set for the `timeColumns`/`dateColumns` default parameters — avoids allocating a new one per call that doesn't need it. */
 const EMPTY_SET: ReadonlySet<string> = new Set();
+
+/**
+ * Quote a SQL single-quoted string literal. Used for CRS identifiers, which
+ * are interpolated rather than bound because `ST_Transform`'s CRS arguments
+ * have to be constant-foldable, not parameters.
+ */
+function quoteLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * A pair of CRS identifiers in a form PROJ accepts (`'EPSG:25832'`,
+ * `'OGC:CRS84'`, a PROJ string), describing how a collection's stored
+ * coordinates relate to the coordinates the API speaks.
+ *
+ * `DuckDBProvider` never produces one — `geometryTransform` returns
+ * `undefined`, so every geometry expression stays exactly as it was. A
+ * subclass whose storage CRS differs from the CRS it advertises returns one
+ * (see `DuckLakeProvider`), which turns on `ST_Transform` on both the read
+ * and the write path.
+ */
+export interface GeometryTransform {
+    /** CRS the geometry is stored in. */
+    storage: string;
+    /** CRS the API reads and writes in — CRS84 for a spec-conformant server. */
+    api: string;
+}
 
 export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBLocals> {
     public override readonly enableSchemas = true;
@@ -71,7 +99,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * guard it anyway so a request that violates it fails with this message
      * instead of a raw `TypeError: Cannot read properties of undefined`.
      */
-    private conn(req: DuckDBRequest): DuckDBConnection {
+    protected conn(req: DuckDBRequest): DuckDBConnection {
         const db = req.res?.locals?.db;
         if (!db) {
             throw new Error(
@@ -85,11 +113,119 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * Quote an identifier for interpolation. DuckDB identifiers are double-quoted
      * and an embedded quote is doubled. Reject a NUL byte outright.
      */
-    private quote(identifier: string): string {
+    protected quote(identifier: string): string {
         if (identifier.includes('\0')) {
             throw new Error(`Invalid identifier: ${identifier}`);
         }
         return `"${identifier.replace(/"/g, '""')}"`;
+    }
+
+    /**
+     * The CRS pair to reproject between for this table, or `undefined` for
+     * none (the default — coordinates are served exactly as stored).
+     *
+     * Resolved once per query by the callers below and threaded into every
+     * geometry expression they build, so a subclass only has to answer "what
+     * CRS is this table in?" rather than reimplement query construction.
+     */
+    protected async geometryTransform(
+        _req: DuckDBRequest,
+        _tableName: string
+    ): Promise<GeometryTransform | undefined> {
+        return undefined;
+    }
+
+    /**
+     * Wrap a *stored* geometry expression so it comes out in the API's CRS —
+     * used for anything the client will see or compare against: GeoJSON
+     * output, collection extents, and the geometry side of a spatial
+     * predicate.
+     *
+     * `always_xy` is not optional here. EPSG:4326 declares latitude first, so
+     * without it `ST_Transform` emits `POINT(lat lon)` and every coordinate
+     * in the response is silently swapped — GeoJSON is always
+     * longitude-first.
+     */
+    protected toApiCrs(expression: string, transform: GeometryTransform | undefined): string {
+        if (!transform) {
+            return expression;
+        }
+        return `ST_Transform(${expression}, ${quoteLiteral(transform.storage)}, ${quoteLiteral(transform.api)}, always_xy := true)`;
+    }
+
+    /**
+     * Wrap a geometry expression that arrived from the *client* (in the API's
+     * CRS) so it can be stored — the inverse of `toApiCrs`, used on the write
+     * path.
+     */
+    protected toStorageCrs(expression: string, transform: GeometryTransform | undefined): string {
+        if (!transform) {
+            return expression;
+        }
+        return `ST_Transform(${expression}, ${quoteLiteral(transform.api)}, ${quoteLiteral(transform.storage)}, always_xy := true)`;
+    }
+
+    /**
+     * The CRS declared by the geometry column's own type, or `undefined`.
+     *
+     * As of the spatial extension shipped with DuckDB 1.5, `GEOMETRY` is a
+     * parameterized type and a CRS-carrying column reports its data type as
+     * `GEOMETRY('EPSG:25832')`. That makes the column type the authoritative
+     * place to look — this is the same value `ST_CRS(geom)` returns for a row
+     * of that column, but read from catalog metadata instead of from data, so
+     * it costs no table scan (which on an object-store-backed table means no
+     * S3 fetch just to answer "what projection is this?").
+     *
+     * Returns `undefined` for a plain `GEOMETRY` column, which is not the same
+     * as "unprojected" — it means the column simply does not say. Note also
+     * that the CRS belongs to the *column type*, not to individual values:
+     * inserting an `ST_SetCRS(...)` value into a plain `GEOMETRY` column
+     * discards it.
+     */
+    protected async declaredGeometryCrs(
+        db: DuckDBConnection,
+        tableName: string,
+        geometryColumn: string
+    ): Promise<string | undefined> {
+        const reader = await db.runAndReadAll(
+            `SELECT data_type FROM duckdb_columns()
+             WHERE database_name = current_database() AND schema_name = current_schema()
+               AND table_name = ? AND column_name = ?`,
+            [tableName, geometryColumn]
+        );
+        const dataType = reader.getRowObjectsJS()[0]?.['data_type'];
+        if (dataType == null) {
+            return undefined;
+        }
+        return crsFromGeometryTypeName(String(dataType));
+    }
+
+    /**
+     * Reproject the geometry column wherever a translated CQL2 filter
+     * references it, so spatial predicates compare like-for-like against
+     * client geometries in the API's CRS.
+     *
+     * Applied to `Cql2ToSql`'s *finished* SQL rather than through its patch
+     * list, because a patch runs too early to work: property names are still
+     * sentinels (`cql2id0`) at patch time and only become quoted identifiers
+     * in the final `resolveSentinels` pass.
+     *
+     * Rewriting the identifier token in finished SQL is safe precisely
+     * because that pass has already run: every string literal has been
+     * replaced by a bound `?`, so a filter comparing a text column to the
+     * literal string `"geometry"` contributes no such token to the SQL. The
+     * only occurrences left are genuine references to the column.
+     */
+    protected projectGeometryReferences(
+        sql: string,
+        geometryColumn: string,
+        transform: GeometryTransform | undefined
+    ): string {
+        if (!transform) {
+            return sql;
+        }
+        const quoted = this.quote(geometryColumn);
+        return sql.split(quoted).join(this.toApiCrs(quoted, transform));
     }
 
     /**
@@ -139,17 +275,17 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * table without a `fid` column — this discovers what is really there.
      * `tableName` is a physical table name (as produced by `physicalTableName`).
      */
-    private async idColumns(db: DuckDBConnection, tableName: string): Promise<string[]> {
+    protected async idColumns(db: DuckDBConnection, tableName: string): Promise<string[]> {
         const reader = await db.runAndReadAll(`
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema = current_schema() AND table_name = ? AND column_name IN ('id', 'fid')
+            WHERE table_catalog = current_database() AND table_schema = current_schema() AND table_name = ? AND column_name IN ('id', 'fid')
             `, [tableName]);
         return reader.getRowObjectsJS().map((row) => String(row['column_name']));
     }
 
     /** Build `"id" = ? OR "fid" = ?` for whichever id columns are present. */
-    private idClause(columns: string[]): string {
+    protected idClause(columns: string[]): string {
         if (columns.length === 0) {
             throw new Error(`Collection has no 'id' or 'fid' column to identify features by`);
         }
@@ -184,7 +320,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * itself. `tableName` is a physical table name (as produced by
      * `physicalTableName`).
      */
-    private async idColumnWithDefault(
+    protected async idColumnWithDefault(
         db: DuckDBConnection,
         tableName: string,
         idCols: string[]
@@ -196,10 +332,26 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const reader = await db.runAndReadAll(`
             SELECT column_default
             FROM information_schema.columns
-            WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?
+            WHERE table_catalog = current_database() AND table_schema = current_schema() AND table_name = ? AND column_name = ?
             `, [tableName, column]);
         const row = reader.getRowObjectsJS()[0];
-        return row && row['column_default'] != null ? column : undefined;
+        if (!row) {
+            return undefined;
+        }
+        const columnDefault = row['column_default'];
+        // A DuckLake-backed catalog renders "no default" as the *string*
+        // `'NULL'` rather than SQL NULL (plain DuckDB gives SQL NULL). A bare
+        // `!= null` test therefore reads every DuckLake column as
+        // self-assigning, which would make `createFeature` drop the client's
+        // id from the INSERT for a column that has nothing to fall back on —
+        // writing a NULL identifier instead of the value that was sent. An
+        // explicit `DEFAULT NULL` in plain DuckDB means the same thing as no
+        // default, so treating both spellings as "no default" is correct on
+        // either backend.
+        if (columnDefault == null || String(columnDefault).trim().toUpperCase() === 'NULL') {
+            return undefined;
+        }
+        return column;
     }
 
     /**
@@ -221,7 +373,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const reader = await db.runAndReadAll(`
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema = current_schema() AND table_name = ?
+            WHERE table_catalog = current_database() AND table_schema = current_schema() AND table_name = ?
             `, [tableName]);
         return reader.getRowObjectsJS().map((row) => String(row['column_name']));
     }
@@ -249,7 +401,8 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         db: DuckDBConnection,
         tableName: string,
         geometryColumn: string | undefined,
-        params: QueryParams
+        params: QueryParams,
+        transform?: GeometryTransform
     ): Promise<Predicate> {
         const clauses: string[] = [];
         const boundParams: DuckDBValue[] = [];
@@ -257,8 +410,17 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const bboxXY = this.bboxXY(params.bbox);
         if (bboxXY && geometryColumn) {
             const [minx, miny, maxx, maxy] = bboxXY;
+            // The *column* is reprojected into the API's CRS rather than the
+            // envelope into storage CRS. Transforming the envelope would be
+            // cheaper (constant-folded once, and it leaves the stored column
+            // available for statistics-based pruning), but a lon/lat rectangle
+            // does not stay a rectangle under reprojection, so its transformed
+            // corner envelope is only an approximation of the real query area
+            // — near the edges that both admits and drops features. This way
+            // `bbox` means exactly what it says, and matches how the CQL2 path
+            // below interprets client geometries.
             clauses.push(
-                `ST_Intersects(${this.quote(geometryColumn)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy}))`
+                `ST_Intersects(${this.toApiCrs(this.quote(geometryColumn), transform)}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy}))`
             );
         }
 
@@ -266,7 +428,13 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             const allowedProperties = await this.columnNames(db, tableName);
             const translator = new Cql2ToSql({ allowedProperties });
             const { sql, params: filterParams } = translator.toSql(params.filter, params.filterLang);
-            clauses.push(`(${sql})`);
+            // A CQL2 spatial predicate's geometry literals are in the API's CRS
+            // (CRS84), so the column they are compared against is reprojected to
+            // match.
+            const projected = geometryColumn
+                ? this.projectGeometryReferences(sql, geometryColumn, transform)
+                : sql;
+            clauses.push(`(${projected})`);
             boundParams.push(...(filterParams as DuckDBValue[]));
         }
 
@@ -323,7 +491,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * where the column may not literally be typed `GEOMETRY`). `tableName` is a
      * physical table name (as produced by `physicalTableName`).
      */
-    private async geometryColumn(
+    protected async geometryColumn(
         db: DuckDBConnection,
         tableName: string,
         broad = false
@@ -335,7 +503,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const reader = await db.runAndReadAll(`
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema = current_schema() AND table_name = ? AND ${typeCondition}
+            WHERE table_catalog = current_database() AND table_schema = current_schema() AND table_name = ? AND ${typeCondition}
             LIMIT 1
             `, [tableName]);
 
@@ -370,7 +538,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * that exact key is present: an unrelated property that happens to be
      * `null` is left completely untouched.
      */
-    private stripDiscoveredGeometryProperty(
+    protected stripDiscoveredGeometryProperty(
         properties: Record<string, unknown>,
         geometryColumn: string | undefined
     ): Record<string, unknown> {
@@ -652,7 +820,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const reader = await db.runAndReadAll(`
                 SELECT table_name
                 FROM information_schema.tables
-                WHERE table_schema = current_schema()
+                WHERE table_catalog = current_database() AND table_schema = current_schema()
                   AND table_schema NOT IN ('information_schema', 'pg_catalog')
                 `);
 
@@ -667,7 +835,11 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
                 id: collectionId,
                 title: collectionId,
                 description: `Collection from table ${collectionId}`,
-                extent: await this.getTableExtent(db, tableName),
+                extent: await this.getTableExtent(
+                    db,
+                    tableName,
+                    await this.geometryTransform(req, tableName)
+                ),
                 itemType: 'feature',
                 crs: [this.defaultCrs],
             });
@@ -685,7 +857,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         const reader = await db.runAndReadAll(`
             SELECT table_name
             FROM information_schema.tables
-            WHERE table_schema = current_schema() AND table_name = ?
+            WHERE table_catalog = current_database() AND table_schema = current_schema() AND table_name = ?
             `, [tableName]);
 
         if (reader.getRowObjectsJS().length === 0) {
@@ -696,24 +868,43 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             id: collectionId,
             title: collectionId,
             description: `Collection from table ${collectionId}`,
-            extent: await this.getTableExtent(db, tableName),
+            extent: await this.getTableExtent(
+                db,
+                tableName,
+                await this.geometryTransform(req, tableName)
+            ),
             itemType: 'feature',
             crs: [this.defaultCrs],
         };
     }
 
     /** `tableName` is a physical table name (as produced by `physicalTableName`). */
-    private async getTableExtent(db: DuckDBConnection, tableName: string): Promise<any> {
+    private async getTableExtent(
+        db: DuckDBConnection,
+        tableName: string,
+        transform?: GeometryTransform
+    ): Promise<any> {
         try {
             const geometryColumn = await this.geometryColumn(db, tableName, true);
 
             if (geometryColumn) {
+                // Reprojected before aggregating, so `extent.spatial.crs`
+                // (always the API's default CRS) describes the numbers actually
+                // reported.
+                const geometryExpression = this.toApiCrs(this.quote(geometryColumn), transform);
+
+                // `ST_Extent_Agg`, not `ST_Extent`: as of the spatial 2.x that
+                // ships with DuckDB 1.5, `ST_Extent` is a *scalar* returning one
+                // bounding box per geometry, so the aggregate-shaped query it
+                // used to be spelled as yields one row per feature and reading
+                // row 0 reports a single arbitrary feature's box as the whole
+                // collection's extent. `ST_Extent_Agg` is the aggregate form.
                 const extent = await db.runAndReadAll(`
           SELECT
-            ST_XMin(ST_Extent(${this.quote(geometryColumn)})) as minx,
-            ST_YMin(ST_Extent(${this.quote(geometryColumn)})) as miny,
-            ST_XMax(ST_Extent(${this.quote(geometryColumn)})) as maxx,
-            ST_YMax(ST_Extent(${this.quote(geometryColumn)})) as maxy
+            ST_XMin(ST_Extent_Agg(${geometryExpression})) as minx,
+            ST_YMin(ST_Extent_Agg(${geometryExpression})) as miny,
+            ST_XMax(ST_Extent_Agg(${geometryExpression})) as maxx,
+            ST_YMax(ST_Extent_Agg(${geometryExpression})) as maxy
           FROM ${this.quote(tableName)}
         `);
                 const extentRow = extent.getRowObjectsJS()[0];
@@ -1087,12 +1278,13 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         // Built once and handed to both this query and `getFeatureCount`, so
         // the features returned and the total reported (`numberMatched`, which
         // drives `next`/`prev` pagination) can never apply different filters.
-        const predicate = await this.buildPredicate(db, tableName, geometryColumn, params);
+        const transform = await this.geometryTransform(req, tableName);
+        const predicate = await this.buildPredicate(db, tableName, geometryColumn, params, transform);
 
         let query = `SELECT *, `;
 
         if (geometryColumn) {
-            query += `ST_AsGeoJSON(${this.quote(geometryColumn)}) as __geometry_json `;
+            query += `ST_AsGeoJSON(${this.toApiCrs(this.quote(geometryColumn), transform)}) as __geometry_json `;
         }
 
         query += `FROM ${this.quote(tableName)} `;
@@ -1149,11 +1341,12 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
 
         const geometryColumn = await this.geometryColumn(db, tableName);
         const { timeColumns, dateColumns } = await this.temporalColumnKinds(db, tableName);
+        const transform = await this.geometryTransform(req, tableName);
 
         let query = `SELECT *, `;
 
         if (geometryColumn) {
-            query += `ST_AsGeoJSON(${this.quote(geometryColumn)}) as __geometry_json `;
+            query += `ST_AsGeoJSON(${this.toApiCrs(this.quote(geometryColumn), transform)}) as __geometry_json `;
         }
 
         const idCols = await this.idColumns(db, tableName);
@@ -1271,7 +1464,10 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             // table actually has, not a hardcoded name, so a submitted
             // geometry is never silently dropped from a PUT.
             const geometryColumn = geometryColumnName ?? 'geometry';
-            setParts.push(`${this.quote(geometryColumn)} = ST_GeomFromGeoJSON(?)`);
+            const transform = await this.geometryTransform(req, tableName);
+            setParts.push(
+                `${this.quote(geometryColumn)} = ${this.toStorageCrs('ST_GeomFromGeoJSON(?)', transform)}`
+            );
             values.push(JSON.stringify(feature.geometry));
         }
 
@@ -1400,7 +1596,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * message. Every call site already has both in scope, so they're taken
      * unconditionally rather than threading an optional pair through.
      */
-    private async translateWriteError(
+    protected async translateWriteError(
         err: unknown,
         properties: Record<string, unknown>,
         db: DuckDBConnection,

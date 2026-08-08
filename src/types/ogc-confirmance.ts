@@ -19,6 +19,17 @@ export enum OGCAPIConformanceClass {
   FEATURES_GMLSF0 = 'http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/gmlsf0',
   FEATURES_GMLSF2 = 'http://www.opengis.net/spec/ogcapi-features-1/1.0/conf/gmlsf2',
 
+  // OGC API - Features - Part 2: Coordinate Reference Systems by Reference
+  FEATURES_CRS = 'http://www.opengis.net/spec/ogcapi-features-2/1.0/conf/crs',
+
+  // OGC API - Features - Part 4: Create, Replace, Update and Delete.
+  // A client decides whether to offer editing from these, so a server with
+  // working write routes that doesn't advertise them reads as read-only —
+  // QGIS, for one, leaves edit mode greyed out.
+  FEATURES_CREATE_REPLACE_DELETE = 'http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/create-replace-delete',
+  FEATURES_UPDATE = 'http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/update',
+  FEATURES_FEATURES = 'http://www.opengis.net/spec/ogcapi-features-4/1.0/conf/features',
+
   // OGC API - Features - Part 5: Schemas
   FEATURES_SCHEMAS = 'http://www.opengis.net/spec/ogcapi-features-5/1.0/conf/schemas',
 

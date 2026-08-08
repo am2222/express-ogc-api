@@ -984,6 +984,24 @@ describe('DuckDBProvider', () => {
     expect(await provider.getCollection(fakeReq(db), 'db2_parks')).not.toBeNull();
   });
 
+  it('reports the extent of every feature, not just the first row', async () => {
+    // `cities` holds London (-0.1276, 51.5074), Paris (2.3522, 48.8566) and
+    // Tokyo (139.6917, 35.6895), so a correct bbox has to span all three.
+    // Guards a real spatial-2.x regression: `ST_Extent` is a *scalar* there
+    // (one bounding box per geometry), not the aggregate it used to be, so
+    // `ST_XMin(ST_Extent(geom)) ... FROM t` yields one row per feature and
+    // reading row 0 silently reports London's own point as the collection
+    // extent. `ST_Extent_Agg` is the aggregate form.
+    const collection = await provider.getCollection(fakeReq(db), 'cities');
+    const bbox = collection?.extent?.spatial?.bbox?.[0] ?? [];
+
+    expect(bbox).toHaveLength(4);
+    expect(bbox[0]).toBeCloseTo(-0.1276, 4); // minx: London
+    expect(bbox[1]).toBeCloseTo(35.6895, 4); // miny: Tokyo
+    expect(bbox[2]).toBeCloseTo(139.6917, 4); // maxx: Tokyo
+    expect(bbox[3]).toBeCloseTo(51.5074, 4); // maxy: London
+  });
+
   it('memoizes collection discovery for the life of one request', async () => {
     const spy = vi.spyOn(db, 'runAndReadAll');
     spy.mockClear();

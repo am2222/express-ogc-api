@@ -72,7 +72,7 @@
     "vitest": "^4.0.16"
   },
   "dependencies": {
-    "@duckdb/node-api": "^1.4.3-r.1",
+    "@duckdb/node-api": "^1.5.5-r.3",
     "@types/geojson": "^7946.0.16",
     "@types/json-schema": "^7.0.15",
     "cql2-wasm": "^0.5.6"

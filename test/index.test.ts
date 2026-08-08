@@ -182,6 +182,27 @@ describe('OGC API LandingPage', () => {
     }
   });
 
+  it('applies a PATCH sent as application/merge-patch+json', async () => {
+    // The content type OGC API - Features Part 4 specifies for PATCH. The
+    // built-in body parser used to accept only application/json and
+    // application/geo+json, so a spec-compliant PATCH arrived with an unparsed
+    // (empty) body: `updateFeature` saw no properties to set, took its
+    // "nothing to update" early return, and answered 204 — a silent no-op that
+    // looks exactly like success to the client.
+    const response = await fetch(`${baseUrl}/ogc/collections/cities/items/sf`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/merge-patch+json' },
+      body: JSON.stringify({ properties: { population: 999333 } }),
+    });
+
+    expect(response.status).toBe(204);
+
+    const updated = await (
+      await fetch(`${baseUrl}/ogc/collections/cities/items/sf`)
+    ).json();
+    expect(updated.properties.population).toBe(999333);
+  });
+
   it('should set CORS headers', async () => {
     const response = await fetch(`${baseUrl}/ogc`, { method: 'OPTIONS' });
 
