@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.2.0...express-ogc-api-v1.3.0) (2026-08-08)
+
+
+### Features
+
+* update DuckLakeProvider documentation to clarify CRS handling in geometry types ([c333be5](https://github.com/am2222/express-ogc-api/commit/c333be51bbd5b5db75fd4af16a71670036523aaa))
+
 ## [1.2.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.1.0...express-ogc-api-v1.2.0) (2026-08-04)
 
 
