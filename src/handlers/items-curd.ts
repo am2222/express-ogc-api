@@ -222,6 +222,8 @@ export class ItemsCURDHandler extends BaseHandler {
         timeStamp: new Date().toISOString(),
       };
 
+      await this.setContentCrs(req as ProviderRequest, res, collectionId);
+
       // OGC API - Features Core requires GeoJSON feature responses to be
       // served as application/geo+json, and clients content-negotiate on it.
       res.type('application/geo+json').json(response);
@@ -258,6 +260,7 @@ export class ItemsCURDHandler extends BaseHandler {
         return;
       }
 
+      await this.setContentCrs(req as ProviderRequest, res, collectionId);
       res.type('application/geo+json').json(feature);
     } catch (err) {
       this.handleReadError(res, next, err);
@@ -409,6 +412,38 @@ export class ItemsCURDHandler extends BaseHandler {
     }
   }
 
+
+
+  /**
+   * Set the `Content-Crs` header OGC API - Features Part 2 requires on a
+   * feature response, naming the CRS the geometry is actually expressed in.
+   *
+   * Without it a client that asked for a non-default CRS has no way to tell
+   * whether the server honoured the request or silently answered in CRS84 —
+   * and if it assumes the former while the server did the latter, every feature
+   * is plotted in the wrong place. Only sent when the provider can say what CRS
+   * it used (`responseCrs`); providers that don't do CRS conversion omit it,
+   * which correctly implies the CRS84 default.
+   */
+  private async setContentCrs(
+    req: ProviderRequest,
+    res: Response,
+    collectionId: string
+  ): Promise<void> {
+    const provider = this.provider as unknown as {
+      responseCrs?: (req: ProviderRequest, collectionId: string) => Promise<string>;
+    };
+    if (!this.provider.enableCrs || typeof provider.responseCrs !== 'function') {
+      return;
+    }
+    try {
+      const crs = await provider.responseCrs(req, collectionId);
+      // Part 2 quotes the URI in angle brackets.
+      res.setHeader('Content-Crs', `<${crs}>`);
+    } catch {
+      // Reporting the CRS must never fail the response that carries the data.
+    }
+  }
 
   setupRoutes(router: Router) {
     // Features - GET

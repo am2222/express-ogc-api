@@ -356,6 +356,214 @@ in one view, which makes the geometry easy to sanity-check.
   so a single request never scans the catalog twice and nothing outlives the
   request. Single-collection reads skip discovery entirely.
 
+### DuckLakeProvider
+
+`DuckLakeProvider` serves a [DuckLake](https://ducklake.select) catalog — a
+Postgres (or other SQL) metadata catalog over Parquet in object storage — as a
+read/write OGC API, scoped to one `{company}_{user}_{project}` tenant per
+request. It extends `DuckDBProvider`, so everything above still applies:
+CQL2 filtering, schemas, queryables, bbox.
+
+```ts
+import express from 'express';
+import { DuckDBInstance } from '@duckdb/node-api';
+import { OGCAPI, DuckLakeProvider, attachDuckLake } from 'express-ogc-api';
+
+const app = express();
+const instance = await DuckDBInstance.create(':memory:');
+
+// ATTACH is instance-wide, so this runs once, not per request.
+const setup = await instance.connect();
+await attachDuckLake(setup, {
+  catalogConnectionString: process.env.DATALAKE_POSTGRES_CONNECTION_STRING!,
+  dataPath: process.env.DATALAKE_S3_PATH!, // s3://bucket/
+  alias: 'lake',
+  s3: { accessKeyId, secretAccessKey, sessionToken, region: 'us-east-1' },
+});
+
+const provider = new DuckLakeProvider({ name: 'lake' });
+const ogc = new OGCAPI(provider, app);
+
+app.use('/:company/:user/:project', async (req, res, next) => {
+  const conn = await instance.connect();
+  await conn.run('LOAD spatial;');
+  await conn.run('USE lake.main');           // required — see below
+  res.locals.db = conn;
+  res.locals.tenant = {
+    company: req.params.company,
+    user: req.params.user,
+    project: req.params.project,
+  };
+  res.on('finish', () => conn.disconnectSync());
+  next();
+}, ogc.getRouter());
+```
+
+A runnable version is `examples/serve-ducklake.ts`.
+
+#### Performance: why the metadata catalog is attached twice
+
+Against a DuckLake catalog, **every metadata lookup is a round trip to the
+catalog database** — measured at roughly 350ms–1.4s each against a remote
+Postgres, and they do not parallelise (a DuckDB connection serialises queries, so
+issuing them concurrently is no faster). The inherited per-table discovery loop
+therefore made `GET /collections` take over a minute for 25 collections, which
+clients time out on.
+
+So `DuckLakeProvider` batches discovery into a fixed handful of queries
+regardless of collection count: one to list tables, one for every geometry column
+and its type, one for every data-file path, and one for every extent. Extents
+come from DuckLake's `ducklake_table_column_stats.extra_stats`, which records a
+bounding box per geometry column, instead of an `ST_Extent_Agg` scan of every
+table's Parquet.
+
+That statistics table is not reachable through the DuckLake attachment, so
+`attachDuckLake` attaches the same catalog a second time as plain read-only
+Postgres, by default as `<alias>_metadata`. Pass `metadataAlias: null` to skip it
+— collections then fall back to scan-based extents, which is correct but slow.
+Tables the statistics don't cover (rows still *inlined* in the catalog, with no
+Parquet file yet) fall back to a scan individually, so an extent is never
+silently dropped.
+
+Two consequences worth knowing:
+
+- A stats-derived extent is **approximate**: the stored bounding box is
+  reprojected by its corners, not by every geometry, so it can differ from a
+  scanned extent by a small margin. OGC allows an approximate extent, and in
+  practice this errs slightly wide rather than narrow.
+- Resolved CRS values are memoised per table for the provider's lifetime. A
+  table's CRS does not change without rewriting its data; restart the process
+  (or pass `crsByCollection`) if it ever does.
+
+#### The connection contract
+
+Beyond `res.locals.db`, this provider needs:
+
+- **`USE <alias>.main` on the connection.** Every metadata lookup is scoped to
+  `current_database()`, which is what stops a same-named table in another
+  attached catalog from being mistaken for a lake table. A connection still
+  pointing at `memory` reports an empty collection list rather than reading the
+  wrong catalog.
+- **`res.locals.tenant`** — `{ company, user, project }`. Each component must be
+  non-empty and `[A-Za-z0-9]` only. `_` is rejected because it separates the
+  triple from the collection id, so a component containing one could be crafted
+  to collide with another tenant's prefix.
+
+Table `GA0gA0DcMF_t5OtsEjChL_7CHCwAJQiO_chambers` is served as collection
+`chambers` to that triple, and is invisible to every other tenant. The prefix is
+only ever *composed and compared*, never parsed out of a table name — layer
+names contain underscores of their own, so splitting on `_` would mis-attribute
+them.
+
+#### Writing to a DuckLake table
+
+DuckLake is not plain DuckDB, and these limits are load-bearing:
+
+| Feature | DuckLake |
+|---|---|
+| `INSERT` / `UPDATE` / `DELETE`, transactions, `ALTER TABLE ADD COLUMN` | supported |
+| `RETURNING` (on insert, update **or** delete) | not supported |
+| `CREATE SEQUENCE`, `DEFAULT nextval()` | not supported |
+| `PRIMARY KEY` / `UNIQUE`, `GENERATED ALWAYS AS IDENTITY`, generated columns | not supported |
+| `NOT NULL`, `DEFAULT uuid()` | supported |
+
+So for a collection to be fully read/write, give it an id column that can
+assign itself:
+
+```sql
+CREATE TABLE lake.main."<company>_<user>_<project>_chambers" (
+  id VARCHAR DEFAULT uuid() NOT NULL,   -- uuid(), not a sequence
+  label VARCHAR,
+  geometry GEOMETRY
+);
+```
+
+Because DuckLake cannot `RETURNING` the value it generated, this provider
+generates the uuid itself and inserts it explicitly, so the new feature is
+readable at the `Location` it reports. A client-supplied id is honoured unless
+it already exists; on collision a `DEFAULT uuid()` column gets a fresh id (so a
+client working from a stale view can still add features), while a column with no
+default gets a 409. There is no `UNIQUE` constraint to violate, so collisions are
+detected with an explicit read.
+
+To retrofit an existing table, note that `ADD COLUMN ... DEFAULT uuid()` is
+rejected (non-literal default): add the column, then `ALTER ... SET DEFAULT
+uuid()`, then backfill with `UPDATE`.
+
+#### Coordinate reference systems
+
+The CRS is discovered automatically — you should not normally have to declare
+anything.
+
+In spatial 2.x `GEOMETRY` is a parameterized type, so a CRS-carrying column
+reports `GEOMETRY('EPSG:32632')`. DuckLake's *catalog* flattens that to a bare
+`geometry`, which is why `ST_CRS` reads `NULL` through a lake table — but the
+**Parquet files DuckLake writes do record it**, in the native Parquet GEOMETRY
+logical type. So the CRS is read from a data file's schema:
+
+```sql
+-- what the provider effectively does, per table, once
+SELECT data_file FROM ducklake_list_files('lake', '<table>');
+DESCRIBE SELECT geometry FROM read_parquet('<that file>');
+-- column_type -> GEOMETRY('EPSG:32632')
+```
+
+`DESCRIBE` resolves this from the file footer without reading a row, and it
+covers both encodings in the wild: DuckLake writes the native Parquet GEOMETRY
+logical type, while DuckDB's own `COPY` writes GeoParquet 1.0 (a `geo` key in
+the file's key/value metadata). The result is memoised per table, since
+`getCollection` runs before every item read.
+
+Full resolution order:
+
+1. `crsByCollection` config — explicit override for mislabelled data
+2. the geometry column's **declared type** (works where the catalog keeps it)
+3. the **Parquet files' recorded CRS** — the normal path for DuckLake
+4. a geometry column **comment**, e.g. `COMMENT ON COLUMN lake.main."<table>".geometry IS 'EPSG:32632'` — a manual fallback for tables whose rows are still *inlined* in the catalog and have no Parquet file yet
+5. `defaultStorageCrs`
+
+The result is reported as the collection's `storageCrs`.
+
+Once a CRS is known, the provider **reprojects with `ST_Transform` on every read
+and write**, so the API speaks CRS84 lon/lat regardless of how the data is
+stored:
+
+| | |
+|---|---|
+| Feature geometry (`items`, `items/{id}`) | reprojected storage → CRS84 |
+| Collection `extent.spatial.bbox` | reprojected, so it matches `extent.spatial.crs` |
+| `bbox=` query parameter | interpreted as CRS84 |
+| CQL2 spatial predicates (`S_INTERSECTS`, …) | interpreted as CRS84 |
+| `POST` / `PUT` geometry | reprojected CRS84 → storage |
+
+`always_xy` is applied throughout: EPSG:4326 declares latitude first, so without
+it every coordinate would come back axis-swapped.
+
+A collection with **no** declared CRS is passed through untouched — nothing can
+be reprojected from an unknown CRS, and guessing would silently move data. So a
+projected collection with no declared CRS still serves raw easting/northing;
+declare the CRS to fix it.
+
+#### Notes and limitations
+
+- **Feature ids.** As with `DuckDBProvider`, only `id` and `fid` are recognised
+  as identity columns. A table whose identifier is called something else
+  (`chamber_id`, say) is readable as a collection but its features have no `id`,
+  so `items/{id}` and the write endpoints can't address them.
+- **Write amplification.** Each write creates a Parquet file and a catalog
+  snapshot, so single-feature `POST`s are an expensive way to bulk-load. Use
+  DuckDB directly for bulk ingest, and run DuckLake's compaction periodically.
+- **Expiring credentials.** ATTACH only touches the catalog, so an expired S3
+  secret surfaces as an HTTP 400 `InvalidToken` on the first data read, not at
+  startup. Call `refreshS3Secret` on a timer for SSO/STS credentials. DuckDB's
+  own `PROVIDER credential_chain` was observed to fail against S3 with
+  SSO-derived credentials — pass the resolved triple explicitly.
+- **QGIS.** This provider advertises the Part 4 conformance classes, which is
+  what makes a client offer editing at all. QGIS's OAPIF client has an open bug
+  ([#65361](https://github.com/qgis/QGIS/issues/65361)) where edit mode can stay
+  greyed out regardless, so verify editing in your QGIS version before relying
+  on it.
+
 ### Custom Providers
 
 Extend `BaseProvider` to create custom data sources. Provider methods that run

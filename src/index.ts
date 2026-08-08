@@ -52,7 +52,18 @@ export class OGCAPI {
   setup() {
     if (this.app && !this.hasJsonParser()) {
       this.app.use(
-        express.json({ type: ['application/json', 'application/geo+json'] })
+        // `application/merge-patch+json` (RFC 7396) is the content type OGC API
+        // - Features Part 4 specifies for PATCH, and it has to be parsed here:
+        // an unparsed body reaches `updateFeature` as empty, which takes its
+        // "nothing to set" early return and answers 204 — indistinguishable
+        // from a successful update, but nothing was written.
+        express.json({
+          type: [
+            'application/json',
+            'application/geo+json',
+            'application/merge-patch+json',
+          ],
+        })
       );
     }
 
@@ -99,7 +110,17 @@ export type { OGCFeaturesConfig, Feature, ProviderRequest, QueryParams, Collecti
 export { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 export type { OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 export { DuckDBProvider } from '@/providers/duck-db-provider';
-export type { DuckDBProviderDef, DuckDBLocals } from '@/providers/duck-db-provider';
+export type {
+  DuckDBProviderDef,
+  DuckDBLocals,
+  GeometryTransform,
+} from '@/providers/duck-db-provider';
+export { DuckLakeProvider, attachDuckLake, refreshS3Secret } from '@/providers/duck-lake-provider';
+export type {
+  DuckLakeTenant,
+  DuckLakeLocals,
+  AttachDuckLakeOptions,
+} from '@/providers/duck-lake-provider';
 
 export { FeatureValidationError } from '@/errors';
 export type { FeatureValidationErrorStatus, FeatureValidationErrorOptions } from '@/errors';
