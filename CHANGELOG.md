@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.3.0...express-ogc-api-v1.4.0) (2026-10-10)
+
+
+### Features
+
+* **provider:** add metadata caching for DuckLakeProvider ([772f071](https://github.com/am2222/express-ogc-api/commit/772f071c017bd4752cf99ade237d75bc0ff0b010))
+
 ## [1.3.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.2.0...express-ogc-api-v1.3.0) (2026-08-08)
 
 
