@@ -10,6 +10,7 @@ import {
 } from '@/providers/duck-db-provider';
 import { FeatureValidationError } from '@/errors';
 import { crsFromGeometryTypeName, normalizeCrs } from '@/providers/geometry-crs';
+import { MetadataMemo } from '@/providers/metadata-memo';
 
 /**
  * The three identifiers that scope a request to one project's layers.
@@ -321,6 +322,18 @@ export class DuckLakeProvider extends DuckDBProvider {
      */
     private readonly collectionsMemo = new WeakMap<object, Promise<Collection[]>>();
 
+    /**
+     * Cross-request memo for per-table metadata (geometry column, temporal
+     * columns, declared CRS) — only when `metadataCacheTtlMs` is set.
+     */
+    private readonly metadataMemo: MetadataMemo | undefined;
+
+    /** `metadataCacheTtlMs`, kept for expiring the two CRS caches above. */
+    private readonly metadataCacheTtlMs: number | undefined;
+
+    /** When the CRS caches were last emptied; see `expireCrsCaches`. */
+    private crsCachesSince = Date.now();
+
     constructor(options: {
         name: string;
         /** Catalog alias the lake is ATTACHed as. Defaults to `lake`. */
@@ -339,6 +352,24 @@ export class DuckLakeProvider extends DuckDBProvider {
          * `filter-crs` — see `crsMode` for why that is not the default.
          */
         crsMode?: 'crs84' | 'native';
+        /**
+         * Remember each table's metadata — geometry column, DATE/TIME columns,
+         * declared CRS — across requests for this many milliseconds.
+         *
+         * Every one of those lookups is a catalog query, and with a remote
+         * catalog (Postgres) each is a network round trip: several per items
+         * request, measured at ~0.5 s apiece against a cross-region catalog,
+         * so a page cost seconds whatever its size. What is cached is the
+         * table's shape, never rows; it changes only when a table is
+         * rewritten, and the TTL bounds how long that can go unnoticed.
+         *
+         * Also bounds `parquetCrsCache`/`commentCrsCache`, which otherwise
+         * live for the life of the process — so a CRS recorded on an existing
+         * table (e.g. a backfilled column comment) is picked up without a
+         * restart. Unset (the default) keeps the old behaviour: no metadata
+         * memo, CRS caches until restart.
+         */
+        metadataCacheTtlMs?: number;
     }) {
         super({ name: options.name });
         this.crsMode = options.crsMode ?? 'crs84';
@@ -350,6 +381,65 @@ export class DuckLakeProvider extends DuckDBProvider {
                 : (options.metadataCatalog ?? `${this.catalogName}_metadata`);
         this.crsByCollection = { ...(options.crsByCollection ?? {}) };
         this.defaultStorageCrs = options.defaultStorageCrs;
+        const ttl = options.metadataCacheTtlMs;
+        this.metadataCacheTtlMs = ttl && ttl > 0 ? ttl : undefined;
+        this.metadataMemo = this.metadataCacheTtlMs ? new MetadataMemo(this.metadataCacheTtlMs) : undefined;
+    }
+
+    protected override geometryColumn(
+        db: DuckDBConnection,
+        tableName: string,
+        broad = false
+    ): Promise<string | undefined> {
+        if (!this.metadataMemo) {
+            return super.geometryColumn(db, tableName, broad);
+        }
+        return this.metadataMemo.memo(`geometryColumn|${broad}|${tableName}`, () =>
+            super.geometryColumn(db, tableName, broad)
+        );
+    }
+
+    protected override temporalColumnKinds(
+        db: DuckDBConnection,
+        tableName: string
+    ): Promise<{ timeColumns: Set<string>; dateColumns: Set<string> }> {
+        if (!this.metadataMemo) {
+            return super.temporalColumnKinds(db, tableName);
+        }
+        return this.metadataMemo.memo(`temporalColumnKinds|${tableName}`, () =>
+            super.temporalColumnKinds(db, tableName)
+        );
+    }
+
+    protected override declaredGeometryCrs(
+        db: DuckDBConnection,
+        tableName: string,
+        geometryColumn: string
+    ): Promise<string | undefined> {
+        if (!this.metadataMemo) {
+            return super.declaredGeometryCrs(db, tableName, geometryColumn);
+        }
+        return this.metadataMemo.memo(`declaredGeometryCrs|${tableName}|${geometryColumn}`, () =>
+            super.declaredGeometryCrs(db, tableName, geometryColumn)
+        );
+    }
+
+    /**
+     * Empty `parquetCrsCache` and `commentCrsCache` once `metadataCacheTtlMs`
+     * has passed since they were last emptied. Coarse — the whole cache goes
+     * at once — but it only has to bound staleness, and a refill is one
+     * lookup per table actually requested afterwards.
+     */
+    private expireCrsCaches(): void {
+        if (!this.metadataCacheTtlMs) {
+            return;
+        }
+        const now = Date.now();
+        if (now - this.crsCachesSince >= this.metadataCacheTtlMs) {
+            this.parquetCrsCache.clear();
+            this.commentCrsCache.clear();
+            this.crsCachesSince = now;
+        }
     }
 
     /**
@@ -443,6 +533,7 @@ export class DuckLakeProvider extends DuckDBProvider {
         tableName: string,
         known?: { column: string; dataType?: string; dataFile?: string }
     ): Promise<string | undefined> {
+        this.expireCrsCaches();
         // Explicit config first, as the operator's escape hatch for data that is
         // mislabelled at the source.
         const configured = this.crsByCollection[collectionId];

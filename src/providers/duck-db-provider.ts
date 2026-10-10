@@ -599,7 +599,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * there for why). `tableName` is a physical table name (as produced by
      * `physicalTableName`).
      */
-    private async temporalColumnKinds(
+    protected async temporalColumnKinds(
         db: DuckDBConnection,
         tableName: string
     ): Promise<{ timeColumns: Set<string>; dateColumns: Set<string> }> {
@@ -676,6 +676,19 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
         }
         if (columnKind === 'date' && value instanceof Date) {
             return this.dateToYMD(value);
+        }
+        // LIST/ARRAY/STRUCT/MAP values arrive as JS arrays and plain objects
+        // whose leaves are converted element by element — so a `BIGINT[]`
+        // holds raw `bigint`s, and without this the first one crashes
+        // `JSON.stringify` and fails the whole page. `columnKind` describes
+        // the column, not its elements, so it is not passed down.
+        if (Array.isArray(value)) {
+            return value.map((element) => this.normalizeValue(element));
+        }
+        if (value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype) {
+            return Object.fromEntries(
+                Object.entries(value).map(([key, field]) => [key, this.normalizeValue(field)])
+            );
         }
         if (typeof value !== 'bigint') {
             return value;
@@ -1252,6 +1265,18 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      */
     private mapDuckDBType(duckdbType: string): CollectionSchemaProperty {
         const type = duckdbType.trim().toUpperCase();
+
+        // Nested types first: the substring checks below would read
+        // `BIGINT[]` (a LIST) or `STRUCT(id BIGINT)` as `integer`, and a
+        // client trusting that would mistype a field whose values are arrays
+        // or objects. `INTEGER[3]` is a fixed-size ARRAY; same shape in JSON.
+        const element = /^(.*)\[\d*\]$/.exec(type);
+        if (element) {
+            return { type: 'array', items: this.mapDuckDBType(element[1]) };
+        }
+        if (type.startsWith('STRUCT(') || type.startsWith('MAP(') || type.startsWith('UNION(')) {
+            return { type: 'object' };
+        }
 
         if (type === 'TIMESTAMP WITH TIME ZONE' || type === 'TIMESTAMPTZ') {
             return { type: 'string', format: 'date-time' };

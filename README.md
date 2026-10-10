@@ -524,6 +524,24 @@ Full resolution order:
 
 The result is reported as the collection's `storageCrs`.
 
+#### Caching table metadata (`metadataCacheTtlMs`)
+
+Before reading a single row, an items request looks up the table's geometry
+column, its `DATE`/`TIME` columns and its declared CRS — each a catalog query.
+Against a remote (Postgres) catalog every one is a network round trip, so a
+page can cost seconds whatever its size. Set `metadataCacheTtlMs` to remember
+that metadata per table across requests:
+
+```ts
+new DuckLakeProvider({ name: 'lake', defaultStorageCrs: 'EPSG:25832', metadataCacheTtlMs: 5 * 60_000 });
+```
+
+Only the table's shape is cached, never rows. The same TTL also bounds the
+Parquet-CRS and comment-CRS memos, which otherwise last until the process
+restarts — so a comment added to an existing table (step 4 above) is picked
+up within the TTL. Unset, nothing changes: no cross-request metadata memo, and
+the CRS memos live for the life of the process.
+
 Once a CRS is known, the provider **reprojects with `ST_Transform` on every read
 and write**, so the API speaks CRS84 lon/lat regardless of how the data is
 stored:

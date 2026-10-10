@@ -1082,6 +1082,45 @@ describe('DuckDBProvider', () => {
     expect(() => JSON.stringify(single)).not.toThrow();
   });
 
+  // A LIST/STRUCT of BIGINT reaches the provider as an array/object of raw
+  // `bigint`s; only top-level values were normalised, so the first nested one
+  // crashed JSON.stringify and 500'd the whole page.
+  it('normalizes BIGINTs nested in LIST and STRUCT values', async () => {
+    await db.run(`
+      CREATE TABLE nested_numbers (
+        id INTEGER PRIMARY KEY,
+        house_ids BIGINT[],
+        info STRUCT(n BIGINT, tags BIGINT[])
+      );
+    `);
+    await db.run(`INSERT INTO nested_numbers VALUES (1, [206, 9223372036854775000], {'n': 7, 'tags': [1, 2]});`);
+
+    const fc = await provider.getFeatures(fakeReq(db), 'nested_numbers', { limit: 10 });
+    expect(() => JSON.stringify(fc)).not.toThrow();
+    expect(fc.features[0]?.properties).toMatchObject({
+      house_ids: [206, '9223372036854775000'],
+      info: { n: 7, tags: [1, 2] },
+    });
+
+    const single = await provider.getFeature(fakeReq(db), 'nested_numbers', '1');
+    expect(() => JSON.stringify(single)).not.toThrow();
+  });
+
+  it('describes LIST and STRUCT columns as array and object in the schema, not integer', async () => {
+    await db.run(`
+      CREATE TABLE IF NOT EXISTS nested_schema (
+        id INTEGER PRIMARY KEY,
+        house_ids BIGINT[],
+        fixed INTEGER[3],
+        info STRUCT(n BIGINT)
+      );
+    `);
+    const schema = await provider.getSchema(fakeReq(db), 'nested_schema');
+    expect(schema.properties?.house_ids).toMatchObject({ type: 'array', items: { type: 'integer' } });
+    expect(schema.properties?.fixed).toMatchObject({ type: 'array', items: { type: 'integer' } });
+    expect(schema.properties?.info).toMatchObject({ type: 'object' });
+  });
+
   // Tenant-key validation (F2) now lives in the `PrefixedDuckDBProvider`
   // subclass, not in the tenant-free library class — see
   // `test/prefixed-duckdb-provider.test.ts`.
