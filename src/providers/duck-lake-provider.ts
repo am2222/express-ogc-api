@@ -1,12 +1,13 @@
 // biome-ignore assist/source/organizeImports: matches the ordering used by duck-db-provider.ts
 import { randomUUID } from 'node:crypto';
 import type { DuckDBConnection, DuckDBValue } from '@duckdb/node-api';
-import type { Collection, Feature, ProviderRequest } from '@/types';
+import type { Collection, Feature, ProviderRequest, UpdateFeatureParams } from '@/types';
 import { OGCAPIConformanceClass, type OGCAPIConformanceItem } from '@/types/ogc-confirmance';
 import {
     DuckDBProvider,
     type DuckDBLocals,
     type GeometryTransform,
+    type Predicate,
 } from '@/providers/duck-db-provider';
 import { FeatureValidationError } from '@/errors';
 import { crsFromGeometryTypeName, normalizeCrs } from '@/providers/geometry-crs';
@@ -328,6 +329,13 @@ export class DuckLakeProvider extends DuckDBProvider {
      */
     private readonly metadataMemo: MetadataMemo | undefined;
 
+    /**
+     * Cross-request memo for `numberMatched` — only when `countCacheTtlMs` is
+     * set. Keyed `<table>|<where>|<params>`, so a write can forget one table's
+     * counts by prefix.
+     */
+    private readonly countMemo: MetadataMemo | undefined;
+
     /** `metadataCacheTtlMs`, kept for expiring the two CRS caches above. */
     private readonly metadataCacheTtlMs: number | undefined;
 
@@ -370,6 +378,20 @@ export class DuckLakeProvider extends DuckDBProvider {
          * memo, CRS caches until restart.
          */
         metadataCacheTtlMs?: number;
+        /**
+         * Remember each items query's `numberMatched` for this many
+         * milliseconds, per table, filter and parameters.
+         *
+         * The count is a full `COUNT(*)` over the filtered table, and it ran
+         * again on every page of the same query — on a 10k-row table against a
+         * remote catalog, ~1 s of every ~1.9 s page, although the total cannot
+         * change between pages. Writes made through this provider (create,
+         * replace, update, delete) forget the table's counts at once, so its
+         * own clients never page against a stale total; a write made to the
+         * lake by anything else can go unnoticed for up to the TTL, which is
+         * what bounds it. Unset (the default) counts every request.
+         */
+        countCacheTtlMs?: number;
     }) {
         super({ name: options.name });
         this.crsMode = options.crsMode ?? 'crs84';
@@ -384,6 +406,89 @@ export class DuckLakeProvider extends DuckDBProvider {
         const ttl = options.metadataCacheTtlMs;
         this.metadataCacheTtlMs = ttl && ttl > 0 ? ttl : undefined;
         this.metadataMemo = this.metadataCacheTtlMs ? new MetadataMemo(this.metadataCacheTtlMs) : undefined;
+        const countTtl = options.countCacheTtlMs;
+        this.countMemo = countTtl && countTtl > 0 ? new MetadataMemo(countTtl) : undefined;
+    }
+
+    /**
+     * Memoised like `geometryColumn`: writes look these two up every time
+     * (`createFeature` needs both, `replaceFeature`/`updateFeature`/
+     * `deleteFeature` the first), and each is a catalog round trip.
+     */
+    protected override idColumns(db: DuckDBConnection, tableName: string): Promise<string[]> {
+        if (!this.metadataMemo) {
+            return super.idColumns(db, tableName);
+        }
+        return this.metadataMemo.memo(`idColumns|${tableName}`, () => super.idColumns(db, tableName));
+    }
+
+    protected override idColumnWithDefault(
+        db: DuckDBConnection,
+        tableName: string,
+        idCols: string[]
+    ): Promise<string | undefined> {
+        if (!this.metadataMemo) {
+            return super.idColumnWithDefault(db, tableName, idCols);
+        }
+        return this.metadataMemo.memo(`idColumnWithDefault|${tableName}|${idCols.join(',')}`, () =>
+            super.idColumnWithDefault(db, tableName, idCols)
+        );
+    }
+
+    protected override getFeatureCount(
+        db: DuckDBConnection,
+        tableName: string,
+        predicate: Predicate
+    ): Promise<number> {
+        if (!this.countMemo) {
+            return super.getFeatureCount(db, tableName, predicate);
+        }
+        // BigInt-safe: a bound parameter can be one, and JSON.stringify throws on it.
+        const params = JSON.stringify(predicate.params, (_key, value) =>
+            typeof value === 'bigint' ? `${value}n` : value
+        );
+        return this.countMemo.memo(`${tableName}|${predicate.where}|${params}`, () =>
+            super.getFeatureCount(db, tableName, predicate)
+        );
+    }
+
+    /** Forget a table's cached counts — after any write to it through this provider. */
+    private forgetCounts(req: DuckLakeRequest, collectionId: string): void {
+        this.countMemo?.forget(`${this.physicalTableName(req, collectionId)}|`);
+    }
+
+    override async replaceFeature(
+        req: DuckLakeRequest,
+        collectionId: string,
+        featureId: string,
+        feature: Feature
+    ): Promise<Feature | null> {
+        try {
+            return await super.replaceFeature(req, collectionId, featureId, feature);
+        } finally {
+            this.forgetCounts(req, collectionId);
+        }
+    }
+
+    override async updateFeature(
+        req: DuckLakeRequest,
+        collectionId: string,
+        featureId: string,
+        params: UpdateFeatureParams
+    ): Promise<Feature | null> {
+        try {
+            return await super.updateFeature(req, collectionId, featureId, params);
+        } finally {
+            this.forgetCounts(req, collectionId);
+        }
+    }
+
+    override async deleteFeature(req: DuckLakeRequest, collectionId: string, featureId: string): Promise<boolean> {
+        try {
+            return await super.deleteFeature(req, collectionId, featureId);
+        } finally {
+            this.forgetCounts(req, collectionId);
+        }
     }
 
     protected override geometryColumn(
@@ -1383,6 +1488,8 @@ export class DuckLakeProvider extends DuckDBProvider {
         // No RETURNING, so there is nothing to read the id out of: it had to
         // be known before the INSERT. A table with no identifier column at
         // all can be written to but not read back by id.
+        // The row is in: the table's cached totals are now one short.
+        this.forgetCounts(req, collectionId);
         return featureId === undefined
             ? null
             : await this.getFeature(req, collectionId, featureId);

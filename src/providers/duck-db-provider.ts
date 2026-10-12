@@ -25,7 +25,7 @@ import { crsFromGeometryTypeName } from '@/providers/geometry-crs';
  * used to build SQL (that already happened in `buildPredicate`), only so a
  * DuckDB failure while running the query can be scoped to "a filter was
  * applied" and named back to the client without leaking generated SQL. */
-interface Predicate {
+export interface Predicate {
     where: string;
     params: DuckDBValue[];
     filter: string | undefined;
@@ -1399,7 +1399,7 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
      * matched. `tableName` is a physical table name (as produced by
      * `physicalTableName`).
      */
-    private async getFeatureCount(
+    protected async getFeatureCount(
         db: DuckDBConnection,
         tableName: string,
         predicate: Predicate

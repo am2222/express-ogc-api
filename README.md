@@ -527,7 +527,8 @@ The result is reported as the collection's `storageCrs`.
 #### Caching table metadata (`metadataCacheTtlMs`)
 
 Before reading a single row, an items request looks up the table's geometry
-column, its `DATE`/`TIME` columns and its declared CRS — each a catalog query.
+column, its `DATE`/`TIME` columns and its declared CRS — and a write also looks
+up its identifier column and that column's default — each a catalog query.
 Against a remote (Postgres) catalog every one is a network round trip, so a
 page can cost seconds whatever its size. Set `metadataCacheTtlMs` to remember
 that metadata per table across requests:
@@ -541,6 +542,23 @@ Parquet-CRS and comment-CRS memos, which otherwise last until the process
 restarts — so a comment added to an existing table (step 4 above) is picked
 up within the TTL. Unset, nothing changes: no cross-request metadata memo, and
 the CRS memos live for the life of the process.
+
+#### Caching `numberMatched` (`countCacheTtlMs`)
+
+Every items page also reports `numberMatched`, which is a `COUNT(*)` over the
+filtered table — run again for each page of the same query, although the
+total cannot change in between. Set `countCacheTtlMs` to count once per table,
+filter and parameters for that long:
+
+```ts
+new DuckLakeProvider({ name: 'lake', metadataCacheTtlMs: 5 * 60_000, countCacheTtlMs: 30_000 });
+```
+
+Any create, replace, update or delete made **through the provider** forgets
+that table's counts immediately, so its own clients never page against a
+stale total. A write made to the lake by something else (a pipeline writing
+directly) can go unreflected in `numberMatched` for up to the TTL; keep it
+short. Unset, every request counts.
 
 Once a CRS is known, the provider **reprojects with `ST_Transform` on every read
 and write**, so the API speaks CRS84 lon/lat regardless of how the data is
