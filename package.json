@@ -1,6 +1,6 @@
 {
   "name": "express-ogc-api",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Modern Express.js middleware for OGC API standards",
   "type": "module",
   "main": "./dist/index.js",

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.4.0...express-ogc-api-v1.5.0) (2026-10-12)
+
+
+### Features
+
+* **provider:** implement geometryWriteExpression for precise storage ([a7c11d3](https://github.com/am2222/express-ogc-api/commit/a7c11d3d636270e6079dd1e4b6a74c8b05e0c271))
+
 ## [1.4.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.3.0...express-ogc-api-v1.4.0) (2026-10-10)
 
 
