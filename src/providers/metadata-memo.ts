@@ -28,4 +28,13 @@ export class MetadataMemo {
         });
         return value;
     }
+
+    /** Drop every entry whose key starts with `prefix` — e.g. all of one table's after a write to it. */
+    forget(prefix: string): void {
+        for (const key of [...this.entries.keys()]) {
+            if (key.startsWith(prefix)) {
+                this.entries.delete(key);
+            }
+        }
+    }
 }
