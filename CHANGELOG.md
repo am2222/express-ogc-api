@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.5.0...express-ogc-api-v1.6.0) (2026-10-12)
+
+
+### Features
+
+* **provider:** add caching for numberMatched and improve metadata memoization ([d13f9c9](https://github.com/am2222/express-ogc-api/commit/d13f9c90427154e52d899a6777365cd215931631))
+
 ## [1.5.0](https://github.com/am2222/express-ogc-api/compare/express-ogc-api-v1.4.0...express-ogc-api-v1.5.0) (2026-10-12)
 
 
