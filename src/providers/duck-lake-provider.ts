@@ -1363,10 +1363,10 @@ export class DuckLakeProvider extends DuckDBProvider {
             // Incoming GeoJSON is in the API's CRS, so it is projected back to
             // the collection's storage CRS on the way in — the inverse of what
             // the read path does.
-            const transform = await this.geometryTransform(req, tableName);
+            const geometry = await this.geometryWriteExpression(req, tableName, feature);
             columns.push(geometryColumnName ?? 'geometry');
-            placeholders.push(this.toStorageCrs('ST_GeomFromGeoJSON(?)', transform));
-            values.push(JSON.stringify(feature.geometry));
+            placeholders.push(geometry.sql);
+            values.push(...geometry.params);
         }
 
         const query = `

@@ -357,6 +357,53 @@ describe('DuckLakeProvider', () => {
             expect(bbox[1]).toBeCloseTo(LAT, 4);
         });
 
+        it('stores a geometryWriteExpression override verbatim on create and replace, skipping the CRS84 round trip', async () => {
+            // A geometry derived in the storage CRS (e.g. snapped to a stored
+            // vertex) has to land bit-for-bit; projecting it out to CRS84 and
+            // back would not reproduce it.
+            const exact = 'POINT (511224.123456789 5488393.987654321)';
+            const moved = 'POINT (511230.111111111 5488400.222222222)';
+            class Exact extends DuckLakeProvider {
+                pending = new WeakMap<object, string>();
+                protected override async geometryWriteExpression(
+                    req: Parameters<DuckLakeProvider['getFeature']>[0],
+                    tableName: string,
+                    feature: Parameters<DuckLakeProvider['createFeature']>[2]
+                ) {
+                    const wkt = this.pending.get(feature);
+                    if (!wkt) return super.geometryWriteExpression(req, tableName, feature);
+                    return { sql: 'ST_GeomFromText(CAST(? AS VARCHAR))', params: [wkt] };
+                }
+            }
+            const exactProvider = new Exact({ name: 'lake' });
+            const stored = async (id: string) =>
+                (
+                    await db.runAndReadAll(
+                        `SELECT ST_AsText(geometry) g FROM "GA0gA0DcMF_t5OtsEjChL_7CHCwAJQiO_projected" WHERE id = ?`,
+                        [id]
+                    )
+                ).getRowObjectsJS()[0]?.g;
+
+            const created = {
+                type: 'Feature' as const,
+                properties: { id: 'exact-1', label: 'exact' },
+                geometry: { type: 'Point' as const, coordinates: [LON, LAT] },
+            };
+            exactProvider.pending.set(created, exact);
+            await exactProvider.createFeature(fakeReq(db, TENANT), 'projected', created);
+            expect(await stored('exact-1')).toBe(exact);
+
+            const replaced = { ...created, properties: { label: 'moved' } };
+            exactProvider.pending.set(replaced, moved);
+            await exactProvider.replaceFeature(fakeReq(db, TENANT), 'projected', 'exact-1', replaced);
+            expect(await stored('exact-1')).toBe(moved);
+
+            // Without an override for this feature, the default still projects CRS84 in.
+            const plain = { ...created, properties: { id: 'exact-2', label: 'plain' } };
+            await exactProvider.createFeature(fakeReq(db, TENANT), 'projected', plain);
+            expect(await stored('exact-2')).toMatch(/^POINT \(511224\.5\d* 5488393\.3\d*\)$/);
+        });
+
         it('round-trips a CRS84 POST: projected into storage, read back as CRS84', async () => {
             const created = await provider.createFeature(fakeReq(db, TENANT), 'projected', {
                 type: 'Feature',
