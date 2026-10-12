@@ -189,6 +189,31 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
     }
 
     /**
+     * The SQL expression, and the values it binds, that a create or replace
+     * writes into the geometry column for `feature`.
+     *
+     * By default it is the client's GeoJSON projected into the storage CRS.
+     * Override it to store a geometry computed some other way — e.g. one
+     * already derived in the storage CRS, which a round trip through the API's
+     * CRS would no longer reproduce bit-for-bit. Every write path that stores
+     * a geometry goes through this one method, so an override cannot be
+     * bypassed by one of them.
+     *
+     * Only called when `feature.geometry` is present.
+     */
+    protected async geometryWriteExpression(
+        req: DuckDBRequest,
+        tableName: string,
+        feature: Feature
+    ): Promise<{ sql: string; params: DuckDBValue[] }> {
+        const transform = await this.geometryTransform(req, tableName);
+        return {
+            sql: this.toStorageCrs('ST_GeomFromGeoJSON(?)', transform),
+            params: [JSON.stringify(feature.geometry)],
+        };
+    }
+
+    /**
      * The CRS declared by the geometry column's own type, or `undefined`.
      *
      * As of the spatial extension shipped with DuckDB 1.5, `GEOMETRY` is a
@@ -1472,9 +1497,10 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             // commonly call it 'geom' or 'wkb_geometry'. Fall back to 'geometry'
             // only if the table doesn't have a recognizable spatial column yet.
             const geometryColumn = geometryColumnName ?? 'geometry';
+            const geometry = await this.geometryWriteExpression(req, tableName, feature);
             columns.push(geometryColumn);
-            placeholders.push('ST_GeomFromGeoJSON(?)');
-            values.push(JSON.stringify(feature.geometry));
+            placeholders.push(geometry.sql);
+            values.push(...geometry.params);
         }
 
         const query = `
@@ -1522,11 +1548,9 @@ export class DuckDBProvider extends BaseProvider<Record<string, string>, DuckDBL
             // table actually has, not a hardcoded name, so a submitted
             // geometry is never silently dropped from a PUT.
             const geometryColumn = geometryColumnName ?? 'geometry';
-            const transform = await this.geometryTransform(req, tableName);
-            setParts.push(
-                `${this.quote(geometryColumn)} = ${this.toStorageCrs('ST_GeomFromGeoJSON(?)', transform)}`
-            );
-            values.push(JSON.stringify(feature.geometry));
+            const geometry = await this.geometryWriteExpression(req, tableName, feature);
+            setParts.push(`${this.quote(geometryColumn)} = ${geometry.sql}`);
+            values.push(...geometry.params);
         }
 
         if (setParts.length === 0) {

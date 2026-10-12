@@ -557,6 +557,33 @@ stored:
 `always_xy` is applied throughout: EPSG:4326 declares latitude first, so without
 it every coordinate would come back axis-swapped.
 
+#### Writing a geometry computed in the storage CRS (`geometryWriteExpression`)
+
+A CRS84 → storage reprojection is not bit-exact: a coordinate read out as
+CRS84 and written back lands a fraction of a millimetre off where it was. That
+matters when a write must reuse a stored coordinate exactly — snapping a new
+line onto an existing vertex, for instance, so that a downstream graph build
+sees them as the same node. `POST`/`PUT` take every stored geometry from one
+`protected` hook, which a subclass can override to store a geometry it already
+computed in the storage CRS:
+
+```ts
+class SnappingProvider extends DuckLakeProvider {
+  private exact = new WeakMap<Feature, string>(); // feature -> hex WKB, storage CRS
+
+  protected override async geometryWriteExpression(req, tableName, feature) {
+    const wkb = this.exact.get(feature);
+    if (wkb === undefined) return super.geometryWriteExpression(req, tableName, feature);
+    return { sql: 'ST_GeomFromHEXWKB(CAST(? AS VARCHAR))', params: [wkb] };
+  }
+}
+```
+
+The default returns `ST_GeomFromGeoJSON(?)` wrapped in the CRS84 → storage
+`ST_Transform` above, bound to the request's GeoJSON. The hook receives the
+same `Feature` object that was passed to `createFeature`/`replaceFeature`, so
+per-request state can be keyed by it, as above.
+
 A collection with **no** declared CRS is passed through untouched — nothing can
 be reprojected from an unknown CRS, and guessing would silently move data. So a
 projected collection with no declared CRS still serves raw easting/northing;

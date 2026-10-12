@@ -942,6 +942,42 @@ describe('DuckDBProvider', () => {
     expect(await provider.deleteFeature(fakeReq(db), 'cities', '6')).toBe(true);
   });
 
+  it('routes create and replace geometry through geometryWriteExpression', async () => {
+    const calls: string[] = [];
+    class Hooked extends DuckDBProvider {
+      protected override async geometryWriteExpression(
+        req: Parameters<DuckDBProvider['getFeature']>[0],
+        tableName: string,
+        feature: Parameters<DuckDBProvider['createFeature']>[2]
+      ) {
+        calls.push(tableName);
+        // Ignore the submitted geometry: store a fixed one instead.
+        void req;
+        void feature;
+        return { sql: 'ST_Point(?, ?)', params: [7, 8] };
+      }
+    }
+    const hooked = new Hooked({ name: 'duckdb' });
+    const created = await hooked.createFeature(fakeReq(db), 'cities', {
+      type: 'Feature',
+      id: 7,
+      geometry: { type: 'Point', coordinates: [1, 2] },
+      properties: { id: 7, name: 'Hooktown', population: 1 },
+    });
+    expect(created?.geometry).toEqual({ type: 'Point', coordinates: [7, 8] });
+
+    await hooked.replaceFeature(fakeReq(db), 'cities', '7', {
+      type: 'Feature',
+      id: 7,
+      geometry: { type: 'Point', coordinates: [3, 4] },
+      properties: { name: 'Hooktown', population: 1 },
+    });
+    expect((await hooked.getFeature(fakeReq(db), 'cities', '7'))?.geometry).toEqual({ type: 'Point', coordinates: [7, 8] });
+    expect(calls).toEqual(['cities', 'cities']);
+
+    expect(await hooked.deleteFeature(fakeReq(db), 'cities', '7')).toBe(true);
+  });
+
   it('leaves the row untouched when updateFeature/replaceFeature get empty properties', async () => {
     const before = await provider.getFeature(fakeReq(db), 'cities', '1');
 
