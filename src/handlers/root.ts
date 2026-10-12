@@ -1,7 +1,7 @@
 import { BaseHandler } from '@/handlers/base-handler';
 import { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 
-import type { LandingPage, Link, OGCFeaturesConfig } from '@/types';
+import type { ConformsTo, LandingPage, Link, OGCFeaturesConfig } from '@/types';
 import type BaseProvider from '@/providers/base-provider';
 import type { NextFunction, Request, Response, Router } from 'express';
 
@@ -74,19 +74,10 @@ export class RootHandler extends BaseHandler {
     }
   }
 
-  private handleConformance(
-    _req: Request,
-    res: Response,
-    next: NextFunction
-  ): void {
-    try {
-      const conformance = {
-        conformsTo: this.provider?.conformanceClasses() || [],
-      };
-      res.status(200).json(conformance);
-    } catch (error) {
-      next(error);
-    }
+  private handleConformance(): ConformsTo {
+    return {
+      conformsTo: this.provider?.conformanceClasses() || [],
+    };
   }
 
   private handleOptionsRequests(_req: Request, res: Response): void {
@@ -99,7 +90,7 @@ export class RootHandler extends BaseHandler {
     res.set('Allow', allowMethods.join(', '));
     res.send();
   }
-  
+
   private generateOpenAPISpec(): any {
     return {
       openapi: '3.0.0',
@@ -394,12 +385,19 @@ export class RootHandler extends BaseHandler {
       }
     };
   }
+
+
+
   setupRoutes(router: Router) {
     // Landing page
     router.get('/', this.handleLandingPage.bind(this));
 
     // Conformance
-    router.get('/conformance', this.handleConformance.bind(this));
+    router.get('/conformance', this.negotiateContent(
+      this.handleConformance(),
+      'conformance'
+    ).bind(this));
+    
     // OPTIONS for root
     router.options('*', this.handleOptionsRequests.bind(this));
 

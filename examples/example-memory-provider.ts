@@ -1,6 +1,6 @@
 
 import express from 'express';
-import { OGCAPI, InMemoryProvider } from '../src/index.js';
+import { InMemoryProvider, OGCAPI } from '../src/index.js';
 
 const app = express();
 const port = process.env.PORT || 3001;

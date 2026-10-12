@@ -319,11 +319,15 @@ export async function insertRoadFeatures(db: DuckDBConnection): Promise<void> {
     console.log(`✓ Inserted ${roads.length} road features`);
 }
 
+
+
 /**
  * Setup complete database with all collections and features
  */
 export async function setupCompleteDatabase(dbPath: string = ':memory:'): Promise<DuckDBInstance> {
     console.log('🚀 Initializing DuckDB database...\n');
+
+    // await connecntToICeberg();
 
     const db = await initializeDuckDB(dbPath);
     const connection = await db.connect();
@@ -373,6 +377,7 @@ const ogcAPI = new OGCAPI(duck, app, {
 });
 
 // Mount the OGC API router
+ogcAPI.setViews();
 app.use('/ogc', ogcAPI.getRouter());
 app.use('/', (req, res) => {
     res.send('Welcome to the OGC API Features Example Server! Visit /ogc for the API endpoints.');

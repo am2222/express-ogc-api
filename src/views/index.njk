@@ -1,0 +1,12 @@
+{% extends 'layout.njk' %}
+
+{% block content %}
+  <section class="my-8">
+    <h2 class="text-xl font-bold mb-4">Items List</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+      {% for item in items %}
+        {% include 'partials/item-card.njk' %}
+      {% endfor %}
+    </div>
+  </section>
+{% endblock %}

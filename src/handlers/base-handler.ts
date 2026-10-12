@@ -89,6 +89,64 @@ export class BaseHandler {
     throw new Error('Must implement setupRoutes in subclass');
   }
 
+  protected negotiateContent(
+    data: any,
+    templateName: string
+  ): (req: Request, res: Response, next: NextFunction) => void {
+    return (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const accept = req.get('Accept') || 'application/json'; // default to JSON
+
+        if (accept.includes('application/json') || accept.includes('application/geo+json') || accept === '*/*') {
+          res.status(200).json(data);
+        } else if (accept.includes('text/html')) {
+          this.renderTemplate(templateName, data)(req, res, next);
+        } else {
+          this.sendError(res, 406, 'Not Acceptable: Supported formats are application/json and text/html');
+        }
+      } catch (error) {
+        next(error);
+      }
+    };
+  }
+
+  protected renderHtml(data: any): string {
+    return `
+      <html>
+        <head><title>OGC API Response</title></head>
+        <body>
+          <h1>Response</h1>
+          <pre>${JSON.stringify(data, null, 2)}</pre>
+        </body>
+      </html>
+    `;
+  }
+
+  renderTemplate(
+    templateName: string,
+    data: any = {}
+  ): (req: Request, res: Response, next: NextFunction) => void {
+    return (_req: Request, res: Response, next: NextFunction) => {
+      const siteData = {
+        title: 'My Basecoat App',
+        user: { name: 'Alice', role: 'Admin' },
+        items: [
+          { id: 1, name: 'Item One', price: 10 },
+          { id: 2, name: 'Item Two', price: 20 },
+          { id: 3, name: 'Item Three', price: 30 }
+        ]
+      };
+      try {
+        res.render('index', {
+          ...siteData,
+          pageTitle: 'Home Page'
+        });
+      } catch (error) {
+        next(error);
+      }
+    };
+  }
+
 }
 
 export default BaseHandler;

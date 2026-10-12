@@ -141,6 +141,8 @@ export class CollectionHandler extends BaseHandler {
     }
   }
 
+  
+
   setupRoutes(router: Router) {
     router.get('/collections', this.handleCollections.bind(this));
     router.get('/collections/:collectionId', this.handleCollection.bind(this));

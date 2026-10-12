@@ -5,9 +5,13 @@ import RootHandler from '@/handlers/root';
 import CRUDHandler from '@/handlers/items-curd';
 import SchemaHandler from '@/handlers/schema';
 import type { BaseProvider } from '@/providers/base-provider';
+import nunjucks from 'nunjucks';
 
 import type { OGCFeaturesConfig } from '@/types';
 import CollectionHandler from '@/handlers/collections';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 
 export class OGCAPI {
   router: Router;
@@ -71,12 +75,26 @@ export class OGCAPI {
     return this.router;
   }
 
+  setViews() {
+    const __dirname = dirname(fileURLToPath(import.meta.url));
+    const viewsDirectory = path.join(__dirname, 'views');
+    this.app.set('views', viewsDirectory);
+
+    this.app.set('view engine', 'njk');  // .njk extension for Nunjucks files
+
+    // Configure Nunjucks (with Express integration)
+    nunjucks.configure(viewsDirectory, {
+      autoescape: true,
+      express: this.app,
+    });
+  }
+
 }
 
 export default OGCAPI;
 export { InMemoryProvider } from '@/providers/in-memory-provider';
 export { BaseProvider } from '@/providers/base-provider';
-export type { OGCFeaturesConfig,Feature } from '@/types';
+export type { OGCFeaturesConfig, Feature } from '@/types';
 export { OGCAPIConformanceClass } from '@/types/ogc-confirmance';
 export { DuckDBProvider } from '@/providers/duck-db-provider';
 export type { DuckDBProviderDef } from '@/providers/duck-db-provider';

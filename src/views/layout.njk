@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/basecoat-css@0.3.9/dist/basecoat.cdn.min.css">
+<script src="https://cdn.jsdelivr.net/npm/basecoat-css@0.3.9/dist/js/all.min.js" defer></script>
+
+</head>
+<body class="bg-background text-foreground min-h-screen flex flex-col">
+  {% include 'partials/header.njk' %}
+
+  <main class="flex-1 container mx-auto p-4">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="bg-muted py-4 text-center text-sm">
+    &copy; 2025 My Basecoat App
+  </footer>
+</body>
+</html>

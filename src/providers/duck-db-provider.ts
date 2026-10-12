@@ -1,4 +1,5 @@
 import duckdb, { DuckDBInstance, DuckDBConnection } from '@duckdb/node-api';
+import { CQL2, parseJson, parseText } from 'cql2-wasm'
 
 // biome-ignore assist/source/organizeImports: <explanation>
 import type {
@@ -77,7 +78,7 @@ export class DuckDBProvider extends BaseProvider {
         LIMIT 1
       `, [tableName]);
 
-      const results=geomCol.getRowObjectsJS()
+            const results = geomCol.getRowObjectsJS()
 
             if (results.length > 0) {
                 const extent = await this.connection.runAndReadAll(`
@@ -89,7 +90,7 @@ export class DuckDBProvider extends BaseProvider {
           FROM ${tableName}
         `);
                 const extentRow = extent.getRowObjectsJS()[0];
-                
+
                 if (extent) {
                     return {
                         spatial: {
@@ -134,7 +135,7 @@ export class DuckDBProvider extends BaseProvider {
     `, [collectionId]);
 
         const properties: Record<string, any> = {};
-        
+
         const cols = columns.getRowObjectsJS();
         for (const col of cols) {
             properties[col.column_name] = {
@@ -188,8 +189,25 @@ export class DuckDBProvider extends BaseProvider {
             query += `WHERE ST_Intersects(${geomCol.column_name}, ST_MakeEnvelope(${minx}, ${miny}, ${maxx}, ${maxy})) `;
         }
 
-        query += `LIMIT ${limit} OFFSET ${offset}`;
+        
 
+        const filterLanguage = params.filterLang;
+        if (params.filter) {
+            const filter = params.filter;
+            let cql2: CQL2;
+            if (filterLanguage === 'cql2-json') {
+                cql2 = parseJson(filter);
+
+            } else if (filterLanguage === 'cql-text') {
+                cql2 = parseText(filter);
+            } else {
+                throw new Error(`Unsupported filter language: ${filterLanguage}`);
+            }
+            const whereClause = cql2.to_sql();
+            query = query.replace('FROM', `FROM ${collectionId} WHERE ${whereClause} AND`);
+        }
+
+        query += `LIMIT ${limit} OFFSET ${offset}`;
         const rows = await this.connection.runAndReadAll(query);
 
         const features: Feature[] = rows.map((row: any) => {
